@@ -1,700 +1,911 @@
-, log warning | Alert if Redis down > 5min |
-| **Circuit Breaker Open** | Error rate > 50% in 5min window | Route to fallback provider | Payment succeeds with fallback | Alert immediately |
-| **All Providers Failed** | All providers exhausted | Return 503 Service Unavailable | Client retries later | Page on-call immediately |
-| **Invalid State Transition** | Concurrent status update | Reject update, log error | Transaction remains in valid state | Alert if frequent |
-| **Duplicate Request (Processing)** | Idempotency key exists with "processing" | Return 409 Conflict | Client polls status | Track duplicate rate |
-| **Duplicate Request (Completed)** | Idempotency key exists with "completed" | Return cached response | Client receives same result | Normal behavior |
-| **Webhook Signature Invalid** | HMAC verification fails | Reject webhook, log security event | Manual investigation | Security alert |
-| **Out-of-Order Webhook** | Webhook timestamp < last update | Ignore webhook | Transaction state unchanged | Log for debugging |
-| **Database Deadlock** | Deadlock detected | Retry transaction 3x | Transaction succeeds on retry | Alert if frequent |
-| **Insufficient Funds** | Provider returns insufficient_funds | Return 402 immediately | Client uses different payment method | Track by customer |
+# Payment Orchestration System - Orchestration Logic
 
-### 7.2 Detailed Failure Scenarios
+## Document Information
+- **Version**: 1.0.0
+- **Last Updated**: 2026-04-09
+- **Author**: Backend Engineering Team
+- **Status**: Production Ready
 
-#### Scenario 1: Provider Timeout
+---
 
-**Situation**: Payment provider doesn't respond within 5 seconds
+## Table of Contents
+1. [Overview](#1-overview)
+2. [Payment Flow](#2-payment-flow)
+3. [Routing Logic](#3-routing-logic)
+4. [Retry Strategy](#4-retry-strategy)
+5. [Circuit Breaker](#5-circuit-breaker)
+6. [Idempotency](#6-idempotency)
+7. [Error Handling](#7-error-handling)
+8. [State Management](#8-state-management)
+9. [Webhook Processing](#9-webhook-processing)
+10. [Code Examples](#10-code-examples)
 
-**Detection**:
+---
+
+## 1. Overview
+
+### 1.1 Orchestration Purpose
+
+The orchestration layer coordinates payment processing across multiple providers by:
+- **Routing**: Selecting the optimal provider based on rules
+- **Retry**: Automatically retrying failed payments
+- **Failover**: Switching to backup providers on failure
+- **Idempotency**: Preventing duplicate payments
+- **Monitoring**: Tracking provider health and performance
+
+### 1.2 Key Components
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              ORCHESTRATION COMPONENTS                    │
+└─────────────────────────────────────────────────────────┘
+
+PaymentOrchestrationService
+├─ RoutingEngine (provider selection)
+├─ RetryManager (retry logic)
+├─ CircuitBreaker (failure isolation)
+├─ IdempotencyService (duplicate prevention)
+└─ EventPublisher (domain events)
+```
+
+---
+
+## 2. Payment Flow
+
+### 2.1 High-Level Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API
+    participant Orchestrator
+    participant Router
+    participant CircuitBreaker
+    participant Provider
+    participant Database
+    participant Cache
+
+    Client->>API: POST /payments
+    API->>API: Validate Request
+    API->>Cache: Check Idempotency Key
+    
+    alt Key Exists (Completed)
+        Cache-->>API: Return Cached Response
+        API-->>Client: 200 OK (Cached)
+    else Key Exists (Processing)
+        Cache-->>API: 409 Conflict
+        API-->>Client: 409 Conflict
+    else New Request
+        Cache->>Cache: Store Key (PROCESSING)
+        API->>Orchestrator: Process Payment
+        
+        Orchestrator->>Database: Create Payment Record
+        Orchestrator->>Router: Select Provider
+        Router-->>Orchestrator: Provider: Stripe
+        
+        Orchestrator->>CircuitBreaker: Check State
+        CircuitBreaker-->>Orchestrator: CLOSED (Healthy)
+        
+        Orchestrator->>Provider: Execute Payment
+        
+        alt Success
+            Provider-->>Orchestrator: Success
+            Orchestrator->>Database: Update Status: SUCCEEDED
+            Orchestrator->>Cache: Update Key (COMPLETED)
+            Orchestrator-->>API: Payment Result
+            API-->>Client: 201 Created
+        else Provider Failure
+            Provider-->>Orchestrator: Timeout/Error
+            Orchestrator->>Router: Get Fallback
+            Router-->>Orchestrator: Provider: PayPal
+            Orchestrator->>Provider: Retry with PayPal
+            Provider-->>Orchestrator: Success
+            Orchestrator->>Database: Update Status: SUCCEEDED
+            Orchestrator->>Cache: Update Key (COMPLETED)
+            Orchestrator-->>API: Payment Result
+            API-->>Client: 201 Created
+        end
+    end
+```
+
+### 2.2 Detailed Step-by-Step Flow
+
+**Step 1: Request Validation**
 ```kotlin
-try {
-    val response = httpClient.post(providerUrl) {
-        contentType(ContentType.Application.Json)
-        setBody(payload)
-        timeout {
-            requestTimeoutMillis = 5000
+fun validatePaymentRequest(request: CreatePaymentRequest) {
+    require(request.amount > 0) { "Amount must be positive" }
+    require(request.currency.length == 3) { "Invalid currency code" }
+    require(request.idempotencyKey.isNotBlank()) { "Idempotency key required" }
+    require(request.customerId.isNotBlank()) { "Customer ID required" }
+}
+```
+
+**Step 2: Idempotency Check**
+```kotlin
+fun checkIdempotency(key: String): IdempotencyResult {
+    val existing = idempotencyService.get(key)
+    
+    return when (existing?.status) {
+        "COMPLETED" -> IdempotencyResult.Completed(existing.response)
+        "PROCESSING" -> IdempotencyResult.Conflict(existing.transactionId)
+        null -> IdempotencyResult.New
+        else -> IdempotencyResult.Failed
+    }
+}
+```
+
+**Step 3: Create Payment Record**
+```kotlin
+@Transactional
+fun createPaymentRecord(request: CreatePaymentRequest): Payment {
+    val payment = Payment(
+        transactionId = generateTransactionId(),
+        idempotencyKey = request.idempotencyKey,
+        customerId = request.customerId,
+        amount = request.amount,
+        currency = request.currency,
+        paymentMethod = request.paymentMethod,
+        status = PaymentStatus.PENDING,
+        retryCount = 0,
+        maxRetries = 3
+    )
+    
+    return paymentRepository.save(payment)
+}
+```
+
+**Step 4: Provider Selection**
+```kotlin
+fun selectProvider(payment: Payment): Provider {
+    val rules = routingEngine.getRoutingRules(payment)
+    
+    // Geographic routing
+    val geoProvider = rules.geographicRules
+        .firstOrNull { it.country == payment.customerCountry }
+        ?.provider
+    
+    if (geoProvider != null && isProviderHealthy(geoProvider)) {
+        return geoProvider
+    }
+    
+    // Fallback to default provider
+    return rules.defaultProvider
+}
+```
+
+**Step 5: Circuit Breaker Check**
+```kotlin
+fun checkCircuitBreaker(provider: Provider): CircuitBreakerState {
+    val state = circuitBreakerService.getState(provider)
+    
+    return when (state) {
+        CircuitBreakerState.CLOSED -> {
+            // Provider is healthy, proceed
+            CircuitBreakerState.CLOSED
+        }
+        CircuitBreakerState.OPEN -> {
+            // Provider is unhealthy, use fallback
+            logger.warn("Circuit breaker OPEN for $provider")
+            CircuitBreakerState.OPEN
+        }
+        CircuitBreakerState.HALF_OPEN -> {
+            // Testing if provider recovered
+            CircuitBreakerState.HALF_OPEN
         }
     }
-} catch (error: HttpRequestTimeoutException) {
-    // Timeout detected
-    handleProviderTimeout(error)
 }
 ```
 
-**Recovery Flow**:
-```
-1. Log timeout event
-2. Update circuit breaker (increment failure count)
-3. Check retry count
-   - If < 3: Wait (exponential backoff), retry same provider
-   - If = 3: Switch to fallback provider
-4. If fallback succeeds: Return success
-5. If all providers timeout: Return 503
-```
-
-**Expected Outcome**: 
-- 80% of timeouts succeed on retry
-- 15% succeed on fallback
-- 5% fail completely (all providers timeout)
-
-**Client Behavior**: Retry with exponential backoff
-
----
-
-#### Scenario 2: Card Declined
-
-**Situation**: Customer's card is declined by provider
-
-**Detection**:
+**Step 6: Execute Payment**
 ```kotlin
-if (response.status == HttpStatusCode.PaymentRequired) {
-    val errorCode = response.body<ErrorResponse>().error.code
-    if (errorCode == "card_declined") {
-        // Card declined
-        handleCardDeclined(response)
-    }
-}
-```
-
-**Recovery Flow**:
-```
-1. Log decline event with reason
-2. Update transaction status to FAILED
-3. Record decline reason in transaction
-4. DO NOT retry (non-retryable error)
-5. Return 402 to client with decline reason
-```
-
-**Expected Outcome**: Client prompts user for different payment method
-
-**Client Behavior**: Do not retry, use different card or payment method
-
----
-
-#### Scenario 3: Database Unavailable
-
-**Situation**: Primary database is down or unreachable
-
-**Detection**:
-```kotlin
-try {
-    transactionRepository.save(transaction)
-} catch (error: DataAccessException) {
-    // Database unavailable
-    handleDatabaseUnavailable(error)
-}
-```
-
-**Recovery Flow**:
-```
-1. Log database error
-2. Retry connection 3x with 1s delay
-3. If still failing:
-   - Check if read replica available
-   - If yes: Use read replica (read-only mode)
-   - If no: Return 503 Service Unavailable
-4. Alert operations team (page on-call)
-5. Trigger database failover (if configured)
-```
-
-**Expected Outcome**: 
-- Automatic failover to replica within 2 minutes
-- Zero data loss (synchronous replication)
-
-**Client Behavior**: Retry after 60 seconds
-
----
-
-#### Scenario 4: Circuit Breaker Opens
-
-**Situation**: Provider error rate exceeds 50% in 5-minute window
-
-**Detection**:
-```kotlin
-val errorRate = calculateErrorRate(provider, windowSeconds = 300)
-if (errorRate > 0.5) {
-    // Open circuit breaker
-    openCircuitBreaker(provider)
-}
-```
-
-**Recovery Flow**:
-```
-1. Open circuit breaker for provider
-2. Log circuit breaker event
-3. Alert operations team
-4. Route all new requests to fallback providers
-5. After 30 seconds: Transition to HALF_OPEN
-6. Allow one test request
-   - If succeeds: Close circuit
-   - If fails: Reopen circuit for another 30s
-```
-
-**Expected Outcome**: 
-- Provider issues isolated
-- Payments continue with fallback providers
-- Automatic recovery when provider healthy
-
-**Monitoring**: Dashboard shows circuit breaker state per provider
-
----
-
-#### Scenario 5: All Providers Failed
-
-**Situation**: Primary and all fallback providers have failed
-
-**Detection**:
-```kotlin
-if (retryContext.attempts.size >= maxAttempts) {
-    if (retryContext.attempts.all { it.status == "failed" }) {
-        // All providers failed
-        handleAllProvidersFailed()
-    }
-}
-```
-
-**Recovery Flow**:
-```
-1. Log critical error
-2. Update transaction status to FAILED
-3. Store all retry attempts for debugging
-4. Return 503 Service Unavailable
-5. Page on-call engineer immediately
-6. Client should retry later (exponential backoff)
-```
-
-**Expected Outcome**: 
-- Rare occurrence (< 0.01% of transactions)
-- Indicates systemic issue
-- Requires immediate investigation
-
-**Client Behavior**: Retry after 5 minutes with exponential backoff
-
----
-
-#### Scenario 6: Concurrent Status Updates
-
-**Situation**: Two processes try to update transaction status simultaneously
-
-**Detection**:
-```kotlin
-// Using optimistic locking with JPA @Version
-try {
-    val transaction = transactionRepository.findById(txnId)
-        .orElseThrow { TransactionNotFoundException() }
+suspend fun executePayment(payment: Payment, provider: Provider): PaymentResult {
+    val startTime = System.currentTimeMillis()
     
-    // JPA automatically checks version field
-    transaction.status = newStatus
-    transactionRepository.save(transaction)
-} catch (error: OptimisticLockingFailureException) {
-    // Concurrent update detected
-    handleConcurrentUpdate()
-}
-```
-
-**Recovery Flow**:
-```
-1. Detect version mismatch
-2. Reload transaction with latest version
-3. Validate if transition still valid
-   - If yes: Retry update with new version
-   - If no: Reject update, log warning
-4. Return appropriate error to caller
-```
-
-**Expected Outcome**: 
-- One update succeeds, others rejected
-- Transaction remains in consistent state
-- No data corruption
-
----
-
-#### Scenario 7: Idempotency Key Collision
-
-**Situation**: Two requests with same idempotency key arrive concurrently
-
-**Detection**:
-```kotlin
-// Using Redis SETNX for atomic lock
-val lockAcquired = redisTemplate.opsForValue().setIfAbsent(
-    "idempotency:$key",
-    "processing",
-    Duration.ofDays(1)
-) ?: false
-
-if (!lockAcquired) {
-    // Collision detected
-    handleIdempotencyCollision()
-}
-```
-
-**Recovery Flow**:
-```
-Request A:
-1. Check Redis: Key not found
-2. SETNX: Success (lock acquired)
-3. Process payment
-4. Update Redis with result
-
-Request B (concurrent):
-1. Check Redis: Key found (status: processing)
-2. Return 409 Conflict
-3. Client polls transaction status
-4. Eventually receives result from Request A
-```
-
-**Expected Outcome**: 
-- Exactly one payment processed
-- No duplicate charges
-- Second request gets cached result
-
-**Client Behavior**: Poll transaction status every 2-5 seconds
-
----
-
-#### Scenario 8: Webhook Replay Attack
-
-**Situation**: Malicious actor replays a webhook to change transaction status
-
-**Detection**:
-```kotlin
-fun verifyWebhookSignature(payload: String, signature: String, secret: String) {
-    val mac = Mac.getInstance("HmacSHA256")
-    val secretKey = SecretKeySpec(secret.toByteArray(), "HmacSHA256")
-    mac.init(secretKey)
-    
-    val expectedSignature = mac.doFinal(payload.toByteArray())
-        .joinToString("") { "%02x".format(it) }
-    
-    if (!MessageDigest.isEqual(signature.toByteArray(), expectedSignature.toByteArray())) {
-        // Invalid signature - potential replay attack
-        throw WebhookSignatureException("Invalid webhook signature")
-    }
-}
-```
-
-**Recovery Flow**:
-```
-1. Verify HMAC signature
-2. If invalid:
-   - Reject webhook (return 401)
-   - Log security event
-   - Alert security team
-   - Block source IP if repeated
-3. If valid:
-   - Check webhook timestamp
-   - Reject if > 5 minutes old (replay protection)
-   - Process webhook
-```
-
-**Expected Outcome**: 
-- Malicious webhooks rejected
-- Transaction state protected
-- Security team alerted
-
----
-
-### 7.3 Recovery Procedures
-
-#### Procedure 1: Manual Transaction Recovery
-
-**When**: Transaction stuck in PROCESSING state for > 10 minutes
-
-**Steps**:
-```bash
-# 1. Query transaction status
-SELECT * FROM transactions WHERE transaction_id = 'txn_123';
-
-# 2. Check provider status
-curl -X GET https://api.stripe.com/v1/charges/ch_123 \
-  -H "Authorization: Bearer sk_live_..."
-
-# 3. Reconcile status
-# If provider shows success but our DB shows processing:
-UPDATE transactions 
-SET status = 'SUCCEEDED',
-    provider_transaction_id = 'ch_123',
-    updated_at = NOW(),
-    completed_at = NOW()
-WHERE transaction_id = 'txn_123';
-
-# 4. Create reconciliation event
-INSERT INTO transaction_events (
-    event_id, transaction_id, event_type,
-    from_status, to_status, timestamp, reason, actor
-) VALUES (
-    'evt_manual_123', 'txn_123', 'reconciled',
-    'PROCESSING', 'SUCCEEDED', NOW(),
-    'Manual reconciliation after provider confirmation',
-    'ops_team'
-);
-
-# 5. Notify customer
-# Send email/webhook with updated status
-```
-
----
-
-#### Procedure 2: Circuit Breaker Manual Override
-
-**When**: Circuit breaker stuck open but provider is healthy
-
-**Steps**:
-```bash
-# 1. Check provider health
-curl -X GET https://api.stripe.com/v1/health
-
-# 2. Verify error rate
-SELECT 
-    COUNT(*) as total,
-    SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failures
-FROM transactions
-WHERE provider = 'stripe'
-  AND created_at > NOW() - INTERVAL '5 minutes';
-
-# 3. If provider healthy, manually close circuit
-redis-cli SET circuit_breaker:stripe:state "CLOSED"
-redis-cli DEL circuit_breaker:stripe:failure_count
-redis-cli DEL circuit_breaker:stripe:opened_at
-
-# 4. Monitor next 10 transactions
-# Ensure success rate returns to normal
-```
-
----
-
-#### Procedure 3: Bulk Transaction Retry
-
-**When**: Provider outage caused multiple failures, need to retry
-
-**Steps**:
-```kotlin
-// 1. Identify failed transactions during outage
-val failedTransactions = transactionRepository.findByStatusAndProviderAndCreatedAtBetween(
-    status = PaymentStatus.FAILED,
-    provider = Provider.STRIPE,
-    startTime = outageStartTime,
-    endTime = outageEndTime
-).filter { it.statusReason?.contains(Regex("timeout|unavailable")) == true }
-
-// 2. Retry each transaction
-failedTransactions.forEach { transaction ->
     try {
-        // Reset status to INITIATED
-        updateTransactionStatus(
-            transactionId = transaction.id,
-            toStatus = PaymentStatus.INITIATED,
-            reason = "Bulk retry after provider outage"
+        // Update status to PROCESSING
+        paymentRepository.updateStatus(payment.id, PaymentStatus.PROCESSING)
+        
+        // Call provider API
+        val response = providerConnector.processPayment(provider, payment)
+        
+        val duration = System.currentTimeMillis() - startTime
+        
+        // Record metrics
+        metricsService.recordPaymentDuration(provider, duration)
+        metricsService.incrementPaymentSuccess(provider)
+        
+        // Update payment record
+        paymentRepository.update(payment.copy(
+            status = PaymentStatus.SUCCEEDED,
+            provider = provider,
+            providerTransactionId = response.transactionId,
+            completedAt = LocalDateTime.now()
+        ))
+        
+        // Publish success event
+        eventPublisher.publish(PaymentSucceededEvent(payment.id))
+        
+        return PaymentResult.Success(response)
+        
+    } catch (e: ProviderTimeoutException) {
+        metricsService.incrementPaymentTimeout(provider)
+        circuitBreakerService.recordFailure(provider)
+        return PaymentResult.Timeout(e)
+        
+    } catch (e: ProviderException) {
+        metricsService.incrementPaymentFailure(provider)
+        circuitBreakerService.recordFailure(provider)
+        return PaymentResult.Failed(e)
+    }
+}
+```
+
+**Step 7: Retry Logic**
+```kotlin
+suspend fun retryPayment(payment: Payment): PaymentResult {
+    if (payment.retryCount >= payment.maxRetries) {
+        return PaymentResult.MaxRetriesExceeded
+    }
+    
+    // Exponential backoff
+    val delayMs = calculateBackoff(payment.retryCount)
+    delay(delayMs)
+    
+    // Get fallback provider
+    val fallbackProvider = routingEngine.getFallbackProvider(payment)
+    
+    // Increment retry count
+    paymentRepository.incrementRetryCount(payment.id)
+    
+    // Record retry attempt
+    retryAttemptRepository.save(RetryAttempt(
+        paymentId = payment.id,
+        attemptNumber = payment.retryCount + 1,
+        provider = fallbackProvider,
+        attemptedAt = LocalDateTime.now()
+    ))
+    
+    // Execute with fallback provider
+    return executePayment(payment, fallbackProvider)
+}
+
+fun calculateBackoff(retryCount: Int): Long {
+    val baseDelay = 1000L // 1 second
+    val maxDelay = 10000L // 10 seconds
+    val exponentialDelay = baseDelay * (2.0.pow(retryCount)).toLong()
+    val jitter = Random.nextLong(0, 1000)
+    
+    return min(exponentialDelay + jitter, maxDelay)
+}
+```
+
+---
+
+## 3. Routing Logic
+
+### 3.1 Geographic Routing
+
+```kotlin
+class GeographicRoutingEngine : RoutingEngine {
+    
+    private val countryProviderMap = mapOf(
+        // North America
+        "US" to Provider.STRIPE,
+        "CA" to Provider.STRIPE,
+        "MX" to Provider.PAYPAL,
+        
+        // Europe
+        "GB" to Provider.STRIPE,
+        "DE" to Provider.ADYEN,
+        "FR" to Provider.ADYEN,
+        "IT" to Provider.ADYEN,
+        "ES" to Provider.ADYEN,
+        
+        // Asia Pacific
+        "IN" to Provider.RAZORPAY,
+        "SG" to Provider.STRIPE,
+        "AU" to Provider.STRIPE,
+        "JP" to Provider.STRIPE,
+        "CN" to Provider.ALIPAY,
+        
+        // Latin America
+        "BR" to Provider.MERCADOPAGO,
+        "AR" to Provider.MERCADOPAGO,
+        "CL" to Provider.PAYPAL,
+        "CO" to Provider.PAYPAL
+    )
+    
+    override fun selectProvider(payment: Payment): Provider {
+        val country = payment.customerCountry ?: "US"
+        
+        // Get preferred provider for country
+        val preferredProvider = countryProviderMap[country] ?: Provider.STRIPE
+        
+        // Check if provider is healthy
+        if (isProviderHealthy(preferredProvider)) {
+            logger.info("Selected $preferredProvider for country $country")
+            return preferredProvider
+        }
+        
+        // Fallback to global provider
+        logger.warn("Preferred provider $preferredProvider unhealthy, using fallback")
+        return getFallbackProvider(country)
+    }
+    
+    private fun getFallbackProvider(country: String): Provider {
+        val fallbackOrder = listOf(
+            Provider.STRIPE,
+            Provider.PAYPAL,
+            Provider.ADYEN
         )
         
-        // Reprocess payment
-        val result = processPaymentRetry(transaction)
+        return fallbackOrder.firstOrNull { isProviderHealthy(it) }
+            ?: Provider.STRIPE // Last resort
+    }
+}
+```
+
+### 3.2 Cost-Based Routing
+
+```kotlin
+class CostBasedRoutingEngine : RoutingEngine {
+    
+    private val providerFees = mapOf(
+        Provider.STRIPE to 0.029, // 2.9% + $0.30
+        Provider.PAYPAL to 0.034, // 3.4% + $0.30
+        Provider.ADYEN to 0.025   // 2.5% + $0.10
+    )
+    
+    override fun selectProvider(payment: Payment): Provider {
+        // Calculate cost for each provider
+        val costs = providerFees.mapValues { (provider, feeRate) ->
+            calculateCost(payment.amount, feeRate)
+        }
         
-        // Log result
-        logger.info("Retry result for ${transaction.id}: ${result.status}")
+        // Select cheapest healthy provider
+        return costs.entries
+            .filter { isProviderHealthy(it.key) }
+            .minByOrNull { it.value }
+            ?.key
+            ?: Provider.STRIPE
+    }
+    
+    private fun calculateCost(amount: Long, feeRate: Double): Double {
+        val fixedFee = 30 // cents
+        return (amount * feeRate) + fixedFee
+    }
+}
+```
+
+### 3.3 Performance-Based Routing
+
+```kotlin
+class PerformanceBasedRoutingEngine : RoutingEngine {
+    
+    override fun selectProvider(payment: Payment): Provider {
+        val providers = listOf(Provider.STRIPE, Provider.PAYPAL, Provider.ADYEN)
         
-        // Rate limit: 10 retries per second
-        Thread.sleep(100)
+        // Get performance metrics for each provider
+        val metrics = providers.associateWith { provider ->
+            ProviderMetrics(
+                successRate = metricsService.getSuccessRate(provider),
+                avgLatency = metricsService.getAverageLatency(provider),
+                availability = metricsService.getAvailability(provider)
+            )
+        }
         
-    } catch (error: Exception) {
-        logger.error("Retry failed for ${transaction.id}: ${error.message}", error)
+        // Calculate score (higher is better)
+        val scores = metrics.mapValues { (_, metric) ->
+            (metric.successRate * 0.5) +
+            ((1000.0 / metric.avgLatency) * 0.3) +
+            (metric.availability * 0.2)
+        }
+        
+        // Select best performing provider
+        return scores.maxByOrNull { it.value }?.key ?: Provider.STRIPE
     }
 }
 
-// 3. Generate reconciliation report
-// Show success/failure counts
+data class ProviderMetrics(
+    val successRate: Double,
+    val avgLatency: Double,
+    val availability: Double
+)
 ```
 
 ---
 
-### 7.4 Monitoring & Alerting
+## 4. Retry Strategy
 
-#### Key Metrics to Monitor
-
-```yaml
-# Prometheus metrics
-
-# Request metrics
-payment_requests_total{status, provider}
-payment_request_duration_seconds{provider, percentile}
-payment_errors_total{error_code, provider}
-
-# Provider metrics
-provider_success_rate{provider}
-provider_latency_seconds{provider, percentile}
-provider_circuit_breaker_state{provider}
-
-# Retry metrics
-payment_retry_attempts_total{provider, attempt_number}
-payment_failover_total{from_provider, to_provider}
-
-# Idempotency metrics
-idempotency_cache_hits_total
-idempotency_conflicts_total
-
-# Database metrics
-database_query_duration_seconds{query_type, percentile}
-database_connection_pool_usage{state}
-```
-
-#### Alert Rules
-
-```yaml
-# alerts.yaml
-
-groups:
-  - name: payment_orchestration
-    interval: 30s
-    rules:
-      # High error rate
-      - alert: HighPaymentErrorRate
-        expr: |
-          rate(payment_errors_total[5m]) / rate(payment_requests_total[5m]) > 0.01
-        for: 2m
-        severity: critical
-        annotations:
-          summary: "Payment error rate above 1%"
-          description: "Error rate: {{ $value | humanizePercentage }}"
-      
-      # Provider circuit breaker open
-      - alert: ProviderCircuitBreakerOpen
-        expr: provider_circuit_breaker_state{state="OPEN"} == 1
-        for: 1m
-        severity: high
-        annotations:
-          summary: "Circuit breaker open for {{ $labels.provider }}"
-      
-      # High latency
-      - alert: HighPaymentLatency
-        expr: |
-          histogram_quantile(0.95, payment_request_duration_seconds) > 2.0
-        for: 5m
-        severity: warning
-        annotations:
-          summary: "P95 latency above 2 seconds"
-      
-      # Database connection pool exhausted
-      - alert: DatabaseConnectionPoolExhausted
-        expr: |
-          database_connection_pool_usage{state="in_use"} / 
-          database_connection_pool_usage{state="total"} > 0.9
-        for: 2m
-        severity: critical
-        annotations:
-          summary: "Database connection pool 90% utilized"
-      
-      # High retry rate
-      - alert: HighRetryRate
-        expr: |
-          rate(payment_retry_attempts_total[5m]) / 
-          rate(payment_requests_total[5m]) > 0.1
-        for: 5m
-        severity: warning
-        annotations:
-          summary: "Retry rate above 10%"
-```
-
----
-
-## 8. Summary
-
-### 8.1 Key Orchestration Principles
-
-✅ **Idempotency First**: Every request is idempotent by design  
-✅ **Fail Fast**: Non-retryable errors return immediately  
-✅ **Retry Smart**: Exponential backoff with circuit breakers  
-✅ **Failover Gracefully**: Automatic fallback to healthy providers  
-✅ **Persist Everything**: Complete audit trail of all operations  
-✅ **Monitor Continuously**: Real-time metrics and alerting  
-✅ **Recover Automatically**: Self-healing where possible  
-
-### 8.2 Performance Characteristics
-
-| Metric | Target | Typical | Worst Case |
-|--------|--------|---------|------------|
-| **Latency (P95)** | < 500ms | 350ms | 2000ms |
-| **Success Rate** | > 99% | 99.5% | 98% |
-| **Retry Rate** | < 5% | 2% | 10% |
-| **Failover Rate** | < 2% | 0.5% | 5% |
-| **Idempotency Hit Rate** | < 1% | 0.1% | 2% |
-
-### 8.3 Operational Runbook
-
-**Daily Operations**:
-- Monitor dashboard for anomalies
-- Review error logs for patterns
-- Check circuit breaker states
-- Verify provider health metrics
-
-**Weekly Operations**:
-- Review retry/failover trends
-- Analyze routing effectiveness
-- Update routing rules if needed
-- Review capacity metrics
-
-**Monthly Operations**:
-- Conduct chaos engineering tests
-- Review and update runbooks
-- Analyze cost per provider
-- Optimize routing strategies
-
-**Incident Response**:
-1. Check monitoring dashboard
-2. Identify affected provider/component
-3. Review recent deployments
-4. Check provider status pages
-5. Execute recovery procedure
-6. Document incident
-7. Conduct post-mortem
-
----
-
-## 9. Testing Strategy
-
-### 9.1 Unit Tests
+### 4.1 Exponential Backoff
 
 ```kotlin
-// Test routing logic
-@Test
-fun `should route card payment to Razorpay for India`() {
-    val context = RoutingContext(
-        country = "IN",
-        paymentMethodType = PaymentMethod.CARD,
-        amount = BigDecimal("10000"),
-        currency = "INR"
-    )
+class RetryManager {
     
-    val decision = routingEngine.routePayment(context)
+    private val maxRetries = 3
+    private val baseDelay = 1000L // 1 second
+    private val maxDelay = 10000L // 10 seconds
+    private val multiplier = 2.0
     
-    assertEquals(Provider.RAZORPAY, decision.primaryProvider)
-    assertTrue(decision.fallbackProviders.contains(Provider.STRIPE))
-}
-
-// Test retry logic
-@Test
-fun `should calculate exponential backoff correctly`() {
-    val delays = listOf(
-        retryManager.calculateExponentialBackoff(1),
-        retryManager.calculateExponentialBackoff(2),
-        retryManager.calculateExponentialBackoff(3)
-    )
-    
-    assertEquals(listOf(1000L, 2000L, 4000L), delays)
-}
-
-// Test idempotency
-@Test
-fun `should detect duplicate request`() {
-    val key = "test_key_123"
-    
-    // First request
-    val result1 = idempotencyService.checkIdempotency(key, "client_123")
-    assertFalse(result1.exists)
-    
-    // Acquire lock
-    idempotencyService.acquireIdempotencyLock(key, "processing")
-    
-    // Second request (concurrent)
-    val result2 = idempotencyService.checkIdempotency(key, "client_123")
-    assertTrue(result2.exists)
-    assertEquals("processing", result2.status)
-}
-```
-
-### 9.2 Integration Tests
-
-```kotlin
-// Test end-to-end payment flow
-@Test
-fun `should process payment successfully end-to-end`() {
-    val request = CreatePaymentRequest(
-        amount = BigDecimal("10000"),
-        currency = "USD",
-        paymentMethod = PaymentMethodDto(
-            type = PaymentMethod.CARD,
-            card = CardDto(token = "tok_visa_4242")
+    suspend fun retryWithBackoff(
+        payment: Payment,
+        operation: suspend (Payment) -> PaymentResult
+    ): PaymentResult {
+        var lastError: Exception? = null
+        
+        repeat(maxRetries) { attempt ->
+            try {
+                val result = operation(payment)
+                
+                if (result is PaymentResult.Success) {
+                    return result
+                }
+                
+                // Calculate delay for next retry
+                val delay = calculateDelay(attempt)
+                logger.info("Retry attempt ${attempt + 1} failed, waiting ${delay}ms")
+                delay(delay)
+                
+            } catch (e: Exception) {
+                lastError = e
+                logger.error("Retry attempt ${attempt + 1} failed", e)
+            }
+        }
+        
+        return PaymentResult.Failed(
+            lastError ?: Exception("Max retries exceeded")
         )
-    )
+    }
     
-    val response = orchestrationService.processPayment(request)
-    
-    assertEquals(PaymentStatus.SUCCEEDED, response.status)
-    assertTrue(response.transactionId.startsWith("txn_"))
-    
-    // Verify database
-    val transaction = transactionRepository.findById(response.transactionId).get()
-    assertEquals(PaymentStatus.SUCCEEDED, transaction.status)
-}
-
-// Test failover
-@Test
-fun `should failover to backup provider on timeout`() {
-    // Mock primary provider to timeout
-    every { stripeConnector.processPayment(any()) } throws TimeoutException()
-    
-    val request = createTestPaymentRequest()
-    val response = orchestrationService.processPayment(request)
-    
-    // Should succeed with fallback provider
-    assertEquals(PaymentStatus.SUCCEEDED, response.status)
-    assertNotEquals(Provider.STRIPE, response.provider)
-    assertTrue(response.provider in listOf(Provider.PAYPAL, Provider.ADYEN))
+    private fun calculateDelay(attempt: Int): Long {
+        val exponentialDelay = (baseDelay * multiplier.pow(attempt)).toLong()
+        val jitter = Random.nextLong(0, 1000)
+        return min(exponentialDelay + jitter, maxDelay)
+    }
 }
 ```
 
-### 9.3 Chaos Engineering Tests
+### 4.2 Retry Decision Logic
 
 ```kotlin
-// Test circuit breaker
-@Test
-fun `should open circuit breaker on high error rate`() {
-    // Simulate 60% error rate
-    repeat(100) { i ->
-        if (i < 60) {
-            simulateProviderError(Provider.STRIPE)
-        } else {
-            simulateProviderSuccess(Provider.STRIPE)
+fun shouldRetry(error: PaymentError): Boolean {
+    return when (error) {
+        // Retry on transient errors
+        is ProviderTimeoutException -> true
+        is NetworkException -> true
+        is ServiceUnavailableException -> true
+        is RateLimitException -> true
+        
+        // Don't retry on permanent errors
+        is CardDeclinedException -> false
+        is InsufficientFundsException -> false
+        is InvalidCardException -> false
+        is AuthenticationException -> false
+        
+        // Maybe retry on provider errors
+        is ProviderException -> error.isRetryable
+        
+        else -> false
+    }
+}
+```
+
+---
+
+## 5. Circuit Breaker
+
+### 5.1 Circuit Breaker States
+
+```kotlin
+enum class CircuitBreakerState {
+    CLOSED,    // Normal operation
+    OPEN,      // Failing, reject requests
+    HALF_OPEN  // Testing recovery
+}
+
+class CircuitBreakerService {
+    
+    private val failureThreshold = 5
+    private val successThreshold = 2
+    private val timeout = Duration.ofSeconds(30)
+    
+    private val states = ConcurrentHashMap<Provider, CircuitBreakerState>()
+    private val failureCounts = ConcurrentHashMap<Provider, AtomicInteger>()
+    private val successCounts = ConcurrentHashMap<Provider, AtomicInteger>()
+    private val lastFailureTime = ConcurrentHashMap<Provider, Instant>()
+    
+    fun getState(provider: Provider): CircuitBreakerState {
+        val state = states.getOrDefault(provider, CircuitBreakerState.CLOSED)
+        
+        // Check if we should transition from OPEN to HALF_OPEN
+        if (state == CircuitBreakerState.OPEN) {
+            val lastFailure = lastFailureTime[provider]
+            if (lastFailure != null && 
+                Duration.between(lastFailure, Instant.now()) > timeout) {
+                transitionTo(provider, CircuitBreakerState.HALF_OPEN)
+                return CircuitBreakerState.HALF_OPEN
+            }
+        }
+        
+        return state
+    }
+    
+    fun recordSuccess(provider: Provider) {
+        val state = getState(provider)
+        
+        when (state) {
+            CircuitBreakerState.HALF_OPEN -> {
+                val successes = successCounts
+                    .computeIfAbsent(provider) { AtomicInteger(0) }
+                    .incrementAndGet()
+                
+                if (successes >= successThreshold) {
+                    transitionTo(provider, CircuitBreakerState.CLOSED)
+                    resetCounters(provider)
+                }
+            }
+            CircuitBreakerState.CLOSED -> {
+                // Reset failure count on success
+                failureCounts[provider]?.set(0)
+            }
+            else -> {}
         }
     }
     
-    // Circuit should be open
-    val circuit = circuitBreakerRegistry.circuitBreaker(Provider.STRIPE.name)
-    assertEquals(CircuitBreaker.State.OPEN, circuit.state)
+    fun recordFailure(provider: Provider) {
+        val failures = failureCounts
+            .computeIfAbsent(provider) { AtomicInteger(0) }
+            .incrementAndGet()
+        
+        lastFailureTime[provider] = Instant.now()
+        
+        if (failures >= failureThreshold) {
+            transitionTo(provider, CircuitBreakerState.OPEN)
+            logger.error("Circuit breaker OPEN for $provider after $failures failures")
+        }
+    }
     
-    // New requests should use fallback
-    val request = createTestPaymentRequest()
-    val response = orchestrationService.processPayment(request)
-    assertNotEquals(Provider.STRIPE, response.provider)
-}
-
-// Test database failover
-@Test
-fun `should failover to replica on database failure`() {
-    // Simulate primary database failure
-    simulateDatabaseFailure("primary")
+    private fun transitionTo(provider: Provider, newState: CircuitBreakerState) {
+        val oldState = states.put(provider, newState)
+        logger.info("Circuit breaker for $provider: $oldState -> $newState")
+        
+        // Publish event
+        eventPublisher.publish(CircuitBreakerStateChangedEvent(
+            provider = provider,
+            oldState = oldState,
+            newState = newState
+        ))
+    }
     
-    // Should failover to replica
-    val request = createTestPaymentRequest()
-    val response = orchestrationService.processPayment(request)
-    
-    // Should succeed (read from replica, write queued)
-    assertTrue(response.status in listOf(PaymentStatus.SUCCEEDED, PaymentStatus.PENDING))
+    private fun resetCounters(provider: Provider) {
+        failureCounts[provider]?.set(0)
+        successCounts[provider]?.set(0)
+    }
 }
 ```
 
 ---
 
-**Document Version**: 1.0.0  
+## 6. Idempotency
+
+### 6.1 Idempotency Implementation
+
+```kotlin
+class IdempotencyService(
+    private val redisTemplate: RedisTemplate<String, String>,
+    private val idempotencyRepository: IdempotencyRepository
+) {
+    
+    private val ttl = Duration.ofHours(24)
+    
+    suspend fun checkAndStore(
+        key: String,
+        request: CreatePaymentRequest
+    ): IdempotencyResult {
+        // Check Redis first (fast path)
+        val cached = redisTemplate.opsForValue().get(key)
+        if (cached != null) {
+            return parseIdempotencyRecord(cached)
+        }
+        
+        // Check database (slow path)
+        val existing = idempotencyRepository.findByKey(key)
+        if (existing != null) {
+            // Cache in Redis
+            cacheIdempotencyRecord(key, existing)
+            return IdempotencyResult.fromRecord(existing)
+        }
+        
+        // Store new idempotency key
+        val record = IdempotencyRecord(
+            key = key,
+            requestHash = hashRequest(request),
+            requestPayload = objectMapper.writeValueAsString(request),
+            status = "PROCESSING",
+            expiresAt = LocalDateTime.now().plus(ttl)
+        )
+        
+        idempotencyRepository.save(record)
+        cacheIdempotencyRecord(key, record)
+        
+        return IdempotencyResult.New
+    }
+    
+    suspend fun markCompleted(
+        key: String,
+        response: PaymentResponse
+    ) {
+        val record = idempotencyRepository.findByKey(key)
+            ?: throw IllegalStateException("Idempotency key not found: $key")
+        
+        val updated = record.copy(
+            status = "COMPLETED",
+            responseStatus = 201,
+            responsePayload = objectMapper.writeValueAsString(response),
+            paymentId = response.transactionId
+        )
+        
+        idempotencyRepository.save(updated)
+        cacheIdempotencyRecord(key, updated)
+    }
+    
+    private fun hashRequest(request: CreatePaymentRequest): String {
+        val json = objectMapper.writeValueAsString(request)
+        return MessageDigest.getInstance("SHA-256")
+            .digest(json.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+    }
+    
+    private fun cacheIdempotencyRecord(key: String, record: IdempotencyRecord) {
+        val json = objectMapper.writeValueAsString(record)
+        redisTemplate.opsForValue().set(key, json, ttl)
+    }
+}
+```
+
+---
+
+## 7. Error Handling
+
+### 7.1 Error Classification
+
+```kotlin
+sealed class PaymentError(message: String) : Exception(message) {
+    // Transient errors (retry)
+    class ProviderTimeout(provider: Provider) : 
+        PaymentError("Provider $provider timed out")
+    
+    class NetworkError(cause: Throwable) : 
+        PaymentError("Network error: ${cause.message}")
+    
+    class ServiceUnavailable(provider: Provider) : 
+        PaymentError("Provider $provider unavailable")
+    
+    // Permanent errors (don't retry)
+    class CardDeclined(reason: String) : 
+        PaymentError("Card declined: $reason")
+    
+    class InsufficientFunds : 
+        PaymentError("Insufficient funds")
+    
+    class InvalidCard(reason: String) : 
+        PaymentError("Invalid card: $reason")
+    
+    // Business errors
+    class ValidationError(field: String, reason: String) : 
+        PaymentError("Validation error on $field: $reason")
+    
+    class IdempotencyConflict(transactionId: String) : 
+        PaymentError("Request already processing: $transactionId")
+}
+```
+
+### 7.2 Error Recovery Matrix
+
+| Error Type | Retry? | Fallback Provider? | Client Action |
+|------------|--------|-------------------|---------------|
+| Provider Timeout | Yes (3x) | Yes | Wait and poll status |
+| Network Error | Yes (3x) | Yes | Retry request |
+| Service Unavailable | Yes (3x) | Yes | Retry after delay |
+| Rate Limit | Yes (after delay) | No | Exponential backoff |
+| Card Declined | No | No | Use different card |
+| Insufficient Funds | No | No | Add funds |
+| Invalid Card | No | No | Fix card details |
+| Validation Error | No | No | Fix request |
+| Idempotency Conflict | No | No | Poll transaction status |
+
+---
+
+## 8. State Management
+
+### 8.1 Payment State Machine
+
+```kotlin
+enum class PaymentStatus {
+    PENDING,      // Initial state
+    PROCESSING,   // Being processed
+    SUCCEEDED,    // Completed successfully
+    FAILED,       // Failed permanently
+    CANCELLED,    // Cancelled by user
+    REFUNDED,     // Refunded after success
+    DISPUTED      // Chargeback/dispute
+}
+
+class PaymentStateMachine {
+    
+    private val validTransitions = mapOf(
+        PaymentStatus.PENDING to setOf(
+            PaymentStatus.PROCESSING,
+            PaymentStatus.CANCELLED
+        ),
+        PaymentStatus.PROCESSING to setOf(
+            PaymentStatus.SUCCEEDED,
+            PaymentStatus.FAILED,
+            PaymentStatus.CANCELLED
+        ),
+        PaymentStatus.SUCCEEDED to setOf(
+            PaymentStatus.REFUNDED,
+            PaymentStatus.DISPUTED
+        ),
+        PaymentStatus.FAILED to emptySet(),
+        PaymentStatus.CANCELLED to emptySet(),
+        PaymentStatus.REFUNDED to emptySet(),
+        PaymentStatus.DISPUTED to emptySet()
+    )
+    
+    fun canTransition(from: PaymentStatus, to: PaymentStatus): Boolean {
+        return validTransitions[from]?.contains(to) == true
+    }
+    
+    fun transition(payment: Payment, newStatus: PaymentStatus): Payment {
+        require(canTransition(payment.status, newStatus)) {
+            "Invalid state transition: ${payment.status} -> $newStatus"
+        }
+        
+        return payment.copy(
+            status = newStatus,
+            updatedAt = LocalDateTime.now()
+        )
+    }
+}
+```
+
+---
+
+## 9. Webhook Processing
+
+### 9.1 Webhook Handler
+
+```kotlin
+class WebhookService {
+    
+    suspend fun processWebhook(
+        provider: Provider,
+        payload: String,
+        signature: String
+    ): WebhookResult {
+        // Verify signature
+        if (!verifySignature(provider, payload, signature)) {
+            logger.error("Invalid webhook signature from $provider")
+            return WebhookResult.InvalidSignature
+        }
+        
+        // Parse webhook
+        val event = parseWebhookEvent(provider, payload)
+        
+        // Find associated payment
+        val payment = paymentRepository.findByProviderTransactionId(
+            event.transactionId
+        ) ?: return WebhookResult.PaymentNotFound
+        
+        // Process event
+        return when (event.type) {
+            "payment.succeeded" -> handlePaymentSucceeded(payment, event)
+            "payment.failed" -> handlePaymentFailed(payment, event)
+            "payment.refunded" -> handlePaymentRefunded(payment, event)
+            else -> WebhookResult.UnknownEventType
+        }
+    }
+    
+    private fun verifySignature(
+        provider: Provider,
+        payload: String,
+        signature: String
+    ): Boolean {
+        val secret = getWebhookSecret(provider)
+        val mac = Mac.getInstance("HmacSHA256")
+        val secretKey = SecretKeySpec(secret.toByteArray(), "HmacSHA256")
+        mac.init(secretKey)
+        
+        val expectedSignature = mac.doFinal(payload.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        
+        return signature == expectedSignature
+    }
+}
+```
+
+---
+
+## 10. Code Examples
+
+### 10.1 Complete Payment Processing
+
+```kotlin
+@Service
+class PaymentOrchestrationService(
+    private val routingEngine: RoutingEngine,
+    private val circuitBreakerService: CircuitBreakerService,
+    private val idempotencyService: IdempotencyService,
+    private val retryManager: RetryManager,
+    private val paymentRepository: PaymentRepository,
+    private val eventPublisher: EventPublisher
+) {
+    
+    suspend fun processPayment(
+        request: CreatePaymentRequest
+    ): PaymentResponse {
+        // 1. Check idempotency
+        when (val result = idempotencyService.checkAndStore(
+            request.idempotencyKey, request
+        )) {
+            is IdempotencyResult.Completed -> return result.response
+            is IdempotencyResult.Conflict -> throw IdempotencyConflictException(
+                result.transactionId
+            )
+            is IdempotencyResult.New -> {} // Continue
+        }
+        
+        // 2. Create payment record
+        val payment = createPaymentRecord(request)
+        
+        try {
+            // 3. Select provider
+            val provider = routingEngine.selectProvider(payment)
+            
+            // 4. Check circuit breaker
+            val cbState = circuitBreakerService.getState(provider)
+            if (cbState == CircuitBreakerState.OPEN) {
+                // Use fallback provider
+                val fallback = routingEngine.getFallbackProvider(payment)
+                return executeWithRetry(payment, fallback)
+            }
+            
+            // 5. Execute payment
+            return executeWithRetry(payment, provider)
+            
+        } catch (e: Exception) {
+            // Mark as failed
+            paymentRepository.updateStatus(payment.id, PaymentStatus.FAILED)
+            idempotencyService.markFailed(request.idempotencyKey)
+            throw e
+        }
+    }
+    
+    private suspend fun executeWithRetry(
+        payment: Payment,
+        provider: Provider
+    ): PaymentResponse {
+        return retryManager.retryWithBackoff(payment) { p ->
+            executePayment(p, provider)
+        }.let { result ->
+            when (result) {
+                is PaymentResult.Success -> {
+                    val response = result.toResponse()
+                    idempotencyService.markCompleted(
+                        payment.idempotencyKey,
+                        response
+                    )
+                    response
+                }
+                else -> throw PaymentFailedException(result.error)
+            }
+        }
+    }
+}
+```
+
+---
+
 **Last Updated**: 2026-04-09  
-**Status**: Production Ready  
-**Next Steps**: Implement orchestration logic, deploy to staging, conduct load testing
+**Document Version**: 1.0.0

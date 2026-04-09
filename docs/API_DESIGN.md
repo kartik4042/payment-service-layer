@@ -1,36 +1,552 @@
-Idempotency-related errors"
-  http_codes: [409]
-  examples:
-    - idempotency_conflict
-    - duplicate_request
+# Payment Orchestration System - API Design
 
-rate_limit_error:
-  description: "Rate limit exceeded"
-  http_codes: [429]
-  examples:
-    - rate_limit_exceeded
-    - too_many_requests
+## Document Information
+- **Version**: 1.0.0
+- **Last Updated**: 2026-04-09
+- **Author**: API Design Team
+- **Status**: Production Ready
 
-provider_error:
-  description: "Payment provider errors"
-  http_codes: [502, 504]
-  examples:
-    - provider_timeout
-    - provider_unavailable
-    - provider_error
+---
 
-api_error:
-  description: "Internal API errors"
-  http_codes: [500, 503]
-  examples:
-    - internal_error
-    - service_unavailable
-    - database_error
+## Table of Contents
+1. [Overview](#1-overview)
+2. [API Principles](#2-api-principles)
+3. [Authentication](#3-authentication)
+4. [Core Endpoints](#4-core-endpoints)
+5. [Error Handling](#5-error-handling)
+6. [Idempotency](#6-idempotency)
+7. [Rate Limiting](#7-rate-limiting)
+8. [Webhooks](#8-webhooks)
+9. [Versioning](#9-versioning)
+10. [Examples](#10-examples)
+
+---
+
+## 1. Overview
+
+### 1.1 API Design Philosophy
+
+The Payment Orchestration API follows RESTful principles with a focus on:
+- **Simplicity**: Easy to understand and integrate
+- **Consistency**: Predictable patterns across all endpoints
+- **Reliability**: Idempotent operations and proper error handling
+- **Security**: Authentication, encryption, and audit logging
+- **Performance**: Optimized for high throughput (1000+ TPS)
+
+### 1.2 Base URL
+
+```
+Production:  https://api.payment-orchestration.com/v1
+Staging:     https://api-staging.payment-orchestration.com/v1
+Development: http://localhost:8080/api/v1
 ```
 
-### 4.2 Standard Error Codes
+### 1.3 Content Type
 
-**Complete Error Code Reference**:
+All requests and responses use JSON:
+```
+Content-Type: application/json
+Accept: application/json
+```
+
+---
+
+## 2. API Principles
+
+### 2.1 RESTful Design
+
+| Method | Usage | Idempotent |
+|--------|-------|------------|
+| GET | Retrieve resources | Yes |
+| POST | Create resources | No (with idempotency key: Yes) |
+| PUT | Update/Replace resources | Yes |
+| PATCH | Partial update | No |
+| DELETE | Remove resources | Yes |
+
+### 2.2 Resource Naming
+
+- Use plural nouns: `/payments`, `/transactions`
+- Use kebab-case: `/bulk-retry`, `/health-check`
+- Avoid verbs in URLs (use HTTP methods instead)
+- Use sub-resources for relationships: `/payments/{id}/events`
+
+### 2.3 HTTP Status Codes
+
+| Code | Meaning | Usage |
+|------|---------|-------|
+| 200 | OK | Successful GET, PUT, PATCH |
+| 201 | Created | Successful POST |
+| 202 | Accepted | Async operation started |
+| 204 | No Content | Successful DELETE |
+| 400 | Bad Request | Invalid request data |
+| 401 | Unauthorized | Missing/invalid authentication |
+| 403 | Forbidden | Insufficient permissions |
+| 404 | Not Found | Resource doesn't exist |
+| 409 | Conflict | Idempotency conflict |
+| 429 | Too Many Requests | Rate limit exceeded |
+| 500 | Internal Server Error | Server error |
+| 502 | Bad Gateway | Provider error |
+| 503 | Service Unavailable | Service down |
+| 504 | Gateway Timeout | Provider timeout |
+
+---
+
+## 3. Authentication
+
+### 3.1 API Key Authentication
+
+**Header Format**:
+```http
+Authorization: Bearer sk_live_abc123xyz789
+```
+
+**Example**:
+```bash
+curl -X POST https://api.payment-orchestration.com/v1/payments \
+  -H "Authorization: Bearer sk_live_abc123xyz789" \
+  -H "Content-Type: application/json" \
+  -d '{"amount": 10000, "currency": "USD"}'
+```
+
+### 3.2 API Key Types
+
+| Type | Prefix | Usage |
+|------|--------|-------|
+| Live | `sk_live_` | Production environment |
+| Test | `sk_test_` | Testing/development |
+| Restricted | `rk_live_` | Limited permissions |
+
+### 3.3 JWT Token (Optional)
+
+For user-specific operations:
+```http
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+---
+
+## 4. Core Endpoints
+
+### 4.1 Create Payment
+
+**Endpoint**: `POST /api/v1/payments`
+
+**Description**: Process a payment through the orchestration system.
+
+**Request Headers**:
+```http
+Content-Type: application/json
+Authorization: Bearer sk_live_abc123xyz789
+Idempotency-Key: unique_key_123
+```
+
+**Request Body**:
+```json
+{
+  "amount": 10000,
+  "currency": "USD",
+  "customerId": "cust_123",
+  "customerEmail": "customer@example.com",
+  "paymentMethod": "CREDIT_CARD",
+  "card": {
+    "token": "tok_visa_4242",
+    "last4": "4242",
+    "brand": "visa",
+    "expiryMonth": 12,
+    "expiryYear": 2025
+  },
+  "billingAddress": {
+    "line1": "123 Main St",
+    "city": "San Francisco",
+    "state": "CA",
+    "postalCode": "94105",
+    "country": "US"
+  },
+  "metadata": {
+    "orderId": "order_456",
+    "description": "Premium subscription",
+    "customField": "value"
+  }
+}
+```
+
+**Response (201 Created)**:
+```json
+{
+  "transactionId": "txn_abc123",
+  "status": "SUCCEEDED",
+  "provider": "STRIPE",
+  "amount": 10000,
+  "currency": "USD",
+  "customerId": "cust_123",
+  "paymentMethod": "CREDIT_CARD",
+  "providerTransactionId": "ch_1234567890",
+  "createdAt": "2026-04-09T05:00:00Z",
+  "updatedAt": "2026-04-09T05:00:02Z",
+  "completedAt": "2026-04-09T05:00:02Z",
+  "metadata": {
+    "orderId": "order_456",
+    "description": "Premium subscription"
+  }
+}
+```
+
+**Field Descriptions**:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `amount` | integer | Yes | Amount in smallest currency unit (cents) |
+| `currency` | string | Yes | ISO 4217 currency code (USD, EUR, GBP) |
+| `customerId` | string | Yes | Unique customer identifier |
+| `customerEmail` | string | No | Customer email for receipts |
+| `paymentMethod` | enum | Yes | CREDIT_CARD, DEBIT_CARD, BANK_TRANSFER |
+| `card.token` | string | Yes* | Tokenized card (from provider) |
+| `billingAddress` | object | No | Billing address for verification |
+| `metadata` | object | No | Custom key-value pairs (max 50 keys) |
+
+*Required for card payments
+
+---
+
+### 4.2 Get Payment
+
+**Endpoint**: `GET /api/v1/payments/{transactionId}`
+
+**Description**: Retrieve payment details and status.
+
+**Request**:
+```bash
+curl -X GET https://api.payment-orchestration.com/v1/payments/txn_abc123 \
+  -H "Authorization: Bearer sk_live_abc123xyz789"
+```
+
+**Response (200 OK)**:
+```json
+{
+  "transactionId": "txn_abc123",
+  "status": "SUCCEEDED",
+  "provider": "STRIPE",
+  "amount": 10000,
+  "currency": "USD",
+  "customerId": "cust_123",
+  "customerEmail": "customer@example.com",
+  "paymentMethod": "CREDIT_CARD",
+  "card": {
+    "last4": "4242",
+    "brand": "visa",
+    "expiryMonth": 12,
+    "expiryYear": 2025
+  },
+  "providerTransactionId": "ch_1234567890",
+  "createdAt": "2026-04-09T05:00:00Z",
+  "updatedAt": "2026-04-09T05:00:02Z",
+  "completedAt": "2026-04-09T05:00:02Z",
+  "events": [
+    {
+      "eventType": "PAYMENT_INITIATED",
+      "timestamp": "2026-04-09T05:00:00Z",
+      "details": {}
+    },
+    {
+      "eventType": "PAYMENT_ROUTED",
+      "provider": "STRIPE",
+      "timestamp": "2026-04-09T05:00:01Z",
+      "details": {
+        "routingReason": "geographic_preference"
+      }
+    },
+    {
+      "eventType": "PAYMENT_SUCCEEDED",
+      "timestamp": "2026-04-09T05:00:02Z",
+      "details": {
+        "providerTransactionId": "ch_1234567890"
+      }
+    }
+  ],
+  "metadata": {
+    "orderId": "order_456",
+    "description": "Premium subscription"
+  }
+}
+```
+
+---
+
+### 4.3 List Payments
+
+**Endpoint**: `GET /api/v1/payments`
+
+**Description**: List payments with filtering and pagination.
+
+**Query Parameters**:
+
+| Parameter | Type | Description | Example |
+|-----------|------|-------------|---------|
+| `status` | string | Filter by status | `SUCCEEDED`, `FAILED` |
+| `customerId` | string | Filter by customer | `cust_123` |
+| `provider` | string | Filter by provider | `STRIPE`, `PAYPAL` |
+| `startDate` | ISO 8601 | Start date filter | `2026-04-01T00:00:00Z` |
+| `endDate` | ISO 8601 | End date filter | `2026-04-09T23:59:59Z` |
+| `limit` | integer | Results per page (max 100) | `50` |
+| `offset` | integer | Pagination offset | `0` |
+
+**Request**:
+```bash
+curl -X GET "https://api.payment-orchestration.com/v1/payments?status=SUCCEEDED&limit=10&offset=0" \
+  -H "Authorization: Bearer sk_live_abc123xyz789"
+```
+
+**Response (200 OK)**:
+```json
+{
+  "data": [
+    {
+      "transactionId": "txn_abc123",
+      "status": "SUCCEEDED",
+      "amount": 10000,
+      "currency": "USD",
+      "provider": "STRIPE",
+      "createdAt": "2026-04-09T05:00:00Z"
+    }
+  ],
+  "pagination": {
+    "total": 1250,
+    "limit": 10,
+    "offset": 0,
+    "hasMore": true
+  }
+}
+```
+
+---
+
+### 4.4 Provider Health Check
+
+**Endpoint**: `GET /api/v1/health/providers`
+
+**Description**: Check health status of all payment providers.
+
+**Response (200 OK)**:
+```json
+{
+  "providers": [
+    {
+      "provider": "STRIPE",
+      "status": "HEALTHY",
+      "uptime": 99.98,
+      "lastCheckTime": "2026-04-09T05:00:00Z",
+      "responseTime": 245,
+      "circuitBreakerState": "CLOSED",
+      "successRate": 99.5
+    },
+    {
+      "provider": "PAYPAL",
+      "status": "DEGRADED",
+      "uptime": 98.5,
+      "lastCheckTime": "2026-04-09T05:00:00Z",
+      "responseTime": 1250,
+      "circuitBreakerState": "HALF_OPEN",
+      "successRate": 95.2
+    }
+  ]
+}
+```
+
+---
+
+### 4.5 Bulk Retry
+
+**Endpoint**: `POST /api/v1/retry/bulk`
+
+**Description**: Retry multiple failed payments in batch.
+
+**Request Body**:
+```json
+{
+  "statuses": ["FAILED"],
+  "provider": "STRIPE",
+  "startTime": "2026-04-08T00:00:00Z",
+  "endTime": "2026-04-09T00:00:00Z",
+  "batchSize": 100
+}
+```
+
+**Response (202 Accepted)**:
+```json
+{
+  "jobId": "bulk_retry_1234567890_5678",
+  "message": "Bulk retry job started",
+  "statusUrl": "/api/v1/retry/bulk/bulk_retry_1234567890_5678",
+  "estimatedCount": 150
+}
+```
+
+---
+
+### 4.6 Get Bulk Retry Status
+
+**Endpoint**: `GET /api/v1/retry/bulk/{jobId}`
+
+**Response (200 OK)**:
+```json
+{
+  "jobId": "bulk_retry_1234567890_5678",
+  "status": "IN_PROGRESS",
+  "totalCount": 150,
+  "processedCount": 75,
+  "successCount": 60,
+  "failedCount": 15,
+  "startedAt": "2026-04-09T05:00:00Z",
+  "estimatedCompletionAt": "2026-04-09T05:15:00Z"
+}
+```
+
+---
+
+### 4.7 Get Audit Events
+
+**Endpoint**: `GET /api/v1/audit/payments/{transactionId}/events`
+
+**Description**: Retrieve complete audit trail for a payment.
+
+**Response (200 OK)**:
+```json
+{
+  "transactionId": "txn_abc123",
+  "events": [
+    {
+      "eventId": "evt_001",
+      "eventType": "PAYMENT_INITIATED",
+      "timestamp": "2026-04-09T05:00:00Z",
+      "actor": "api_client_123",
+      "ipAddress": "192.168.1.100",
+      "userAgent": "PaymentSDK/1.0",
+      "payload": {
+        "amount": 10000,
+        "currency": "USD"
+      }
+    },
+    {
+      "eventId": "evt_002",
+      "eventType": "PAYMENT_ROUTED",
+      "timestamp": "2026-04-09T05:00:01Z",
+      "provider": "STRIPE",
+      "routingReason": "geographic_preference",
+      "details": {
+        "country": "US",
+        "selectedProvider": "STRIPE",
+        "fallbackProviders": ["PAYPAL", "ADYEN"]
+      }
+    }
+  ]
+}
+```
+
+---
+
+## 5. Error Handling
+
+### 5.1 Error Response Format
+
+All errors follow a consistent structure:
+
+```json
+{
+  "error": {
+    "code": "validation_error",
+    "message": "Invalid request parameters",
+    "details": [
+      {
+        "field": "amount",
+        "issue": "Amount must be greater than 0"
+      }
+    ],
+    "requestId": "req_abc123",
+    "timestamp": "2026-04-09T05:00:00Z"
+  }
+}
+```
+
+### 5.2 Error Categories
+
+**validation_error**:
+```yaml
+description: "Request validation failed"
+http_codes: [400]
+examples:
+  - invalid_amount
+  - missing_required_field
+  - invalid_currency
+```
+
+**authentication_error**:
+```yaml
+description: "Authentication failed"
+http_codes: [401]
+examples:
+  - invalid_api_key
+  - expired_token
+  - missing_authorization
+```
+
+**authorization_error**:
+```yaml
+description: "Insufficient permissions"
+http_codes: [403]
+examples:
+  - access_denied
+  - insufficient_permissions
+```
+
+**payment_error**:
+```yaml
+description: "Payment processing errors"
+http_codes: [402]
+examples:
+  - card_declined
+  - insufficient_funds
+  - invalid_card_number
+```
+
+**idempotency_error**:
+```yaml
+description: "Idempotency-related errors"
+http_codes: [409]
+examples:
+  - idempotency_conflict
+  - duplicate_request
+```
+
+**rate_limit_error**:
+```yaml
+description: "Rate limit exceeded"
+http_codes: [429]
+examples:
+  - rate_limit_exceeded
+  - too_many_requests
+```
+
+**provider_error**:
+```yaml
+description: "Payment provider errors"
+http_codes: [502, 504]
+examples:
+  - provider_timeout
+  - provider_unavailable
+  - provider_error
+```
+
+**api_error**:
+```yaml
+description: "Internal API errors"
+http_codes: [500, 503]
+examples:
+  - internal_error
+  - service_unavailable
+  - database_error
+```
+
+### 5.3 Standard Error Codes
 
 | Error Code | HTTP Status | Description | Retry? |
 |------------|-------------|-------------|--------|
@@ -61,498 +577,260 @@ api_error:
 | `database_error` | 500 | Database error | Yes |
 | `resource_not_found` | 404 | Resource not found | No |
 
-### 4.3 Error Response Best Practices
+---
 
-**Client Error Handling Guidelines**:
+## 6. Idempotency
 
-```typescript
-// Example client-side error handling
-async function createPayment(request: CreatePaymentRequest): Promise<Payment> {
-  try {
-    const response = await fetch('/api/v1/payments', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'Idempotency-Key': request.idempotency_key
-      },
-      body: JSON.stringify(request)
-    });
-    
-    if (!response.ok) {
-      const error = await response.json();
-      
-      switch (response.status) {
-        case 400:
-          // Validation error - fix request and retry
-          throw new ValidationError(error);
-        
-        case 401:
-          // Authentication error - refresh credentials
-          throw new AuthenticationError(error);
-        
-        case 402:
-          // Payment declined - prompt for different payment method
-          throw new PaymentDeclinedError(error);
-        
-        case 409:
-          // Idempotency conflict - poll transaction status
-          return await pollTransactionStatus(error.transaction_id);
-        
-        case 429:
-          // Rate limit - wait and retry
-          await sleep(60000);
-          return await createPayment(request);
-        
-        case 500:
-        case 503:
-        case 504:
-          // Server/provider error - retry with exponential backoff
-          return await retryWithBackoff(() => createPayment(request));
-        
-        default:
-          throw new UnknownError(error);
-      }
-    }
-    
-    return await response.json();
-  } catch (error) {
-    // Handle network errors
-    if (error instanceof NetworkError) {
-      return await retryWithBackoff(() => createPayment(request));
-    }
-    throw error;
+### 6.1 Idempotency Keys
+
+Use idempotency keys to safely retry requests:
+
+```http
+POST /api/v1/payments
+Idempotency-Key: unique_key_123
+```
+
+**Rules**:
+- Keys must be unique per request
+- Keys are valid for 24 hours
+- Same key returns same response
+- Use UUIDs or unique identifiers
+
+**Example**:
+```bash
+# First request
+curl -X POST https://api.payment-orchestration.com/v1/payments \
+  -H "Authorization: Bearer sk_live_abc123xyz789" \
+  -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -d '{"amount": 10000, "currency": "USD"}'
+
+# Retry (returns same response)
+curl -X POST https://api.payment-orchestration.com/v1/payments \
+  -H "Authorization: Bearer sk_live_abc123xyz789" \
+  -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -d '{"amount": 10000, "currency": "USD"}'
+```
+
+### 6.2 Conflict Handling
+
+If request is still processing:
+
+**Response (409 Conflict)**:
+```json
+{
+  "error": {
+    "code": "idempotency_conflict",
+    "message": "Request with this idempotency key is still processing",
+    "transactionId": "txn_abc123",
+    "statusUrl": "/api/v1/payments/txn_abc123"
   }
 }
 ```
 
 ---
 
-## 5. Versioning & Compatibility
+## 7. Rate Limiting
 
-### 5.1 API Versioning Strategy
+### 7.1 Rate Limits
 
-**Versioning Approach**: URL-based versioning
+| Tier | Requests/Second | Requests/Hour |
+|------|-----------------|---------------|
+| Free | 10 | 1,000 |
+| Basic | 50 | 10,000 |
+| Pro | 200 | 50,000 |
+| Enterprise | Custom | Custom |
 
-**Current Version**: v1
+### 7.2 Rate Limit Headers
 
-**Version Format**: `/api/v{major_version}/{resource}`
+```http
+X-RateLimit-Limit: 200
+X-RateLimit-Remaining: 150
+X-RateLimit-Reset: 1617235200
+```
 
-**Examples**:
-- `/api/v1/payments`
-- `/api/v2/payments` (future)
+### 7.3 Rate Limit Exceeded
 
-### 5.2 Backward Compatibility Rules
+**Response (429 Too Many Requests)**:
+```json
+{
+  "error": {
+    "code": "rate_limit_exceeded",
+    "message": "Rate limit exceeded. Retry after 60 seconds",
+    "retryAfter": 60
+  }
+}
+```
 
-**Breaking Changes** (require new major version):
-- Removing fields from response
-- Changing field types
-- Renaming fields
-- Changing validation rules (more restrictive)
-- Removing endpoints
-- Changing authentication mechanism
+---
 
-**Non-Breaking Changes** (can be added to existing version):
-- Adding new optional fields to request
-- Adding new fields to response
+## 8. Webhooks
+
+### 8.1 Webhook Events
+
+Subscribe to payment events:
+
+| Event | Description |
+|-------|-------------|
+| `payment.initiated` | Payment started |
+| `payment.succeeded` | Payment completed successfully |
+| `payment.failed` | Payment failed |
+| `payment.refunded` | Payment refunded |
+| `payment.disputed` | Payment disputed/chargeback |
+
+### 8.2 Webhook Payload
+
+```json
+{
+  "id": "evt_abc123",
+  "type": "payment.succeeded",
+  "createdAt": "2026-04-09T05:00:00Z",
+  "data": {
+    "transactionId": "txn_abc123",
+    "status": "SUCCEEDED",
+    "amount": 10000,
+    "currency": "USD",
+    "provider": "STRIPE",
+    "providerTransactionId": "ch_1234567890"
+  }
+}
+```
+
+### 8.3 Webhook Signature Verification
+
+Verify webhook authenticity using HMAC-SHA256:
+
+```kotlin
+fun verifyWebhookSignature(
+    payload: String,
+    signature: String,
+    secret: String
+): Boolean {
+    val mac = Mac.getInstance("HmacSHA256")
+    val secretKey = SecretKeySpec(secret.toByteArray(), "HmacSHA256")
+    mac.init(secretKey)
+    val expectedSignature = mac.doFinal(payload.toByteArray())
+        .joinToString("") { "%02x".format(it) }
+    return signature == expectedSignature
+}
+```
+
+---
+
+## 9. Versioning
+
+### 9.1 API Versions
+
+- Current: `v1`
+- Deprecated: None
+- Sunset: None
+
+### 9.2 Version Header
+
+```http
+API-Version: 2026-04-09
+```
+
+### 9.3 Breaking Changes
+
+Breaking changes require new API version. Non-breaking changes:
 - Adding new endpoints
-- Adding new query parameters
-- Relaxing validation rules
+- Adding optional fields
+- Adding new event types
 - Adding new error codes
 
-### 5.3 Deprecation Policy
+---
 
-**Deprecation Timeline**:
-1. **Announcement**: 6 months before deprecation
-2. **Warning Headers**: Add deprecation warnings to responses
-3. **Migration Period**: 6 months to migrate
-4. **Sunset**: API version removed
+## 10. Examples
 
-**Deprecation Headers**:
-```http
-Deprecation: true
-Sunset: Sat, 01 Jan 2027 00:00:00 GMT
-Link: <https://docs.payment-orchestration.com/migration/v1-to-v2>; rel="deprecation"
+### 10.1 Complete Payment Flow
+
+```bash
+# 1. Create payment
+RESPONSE=$(curl -X POST https://api.payment-orchestration.com/v1/payments \
+  -H "Authorization: Bearer sk_live_abc123xyz789" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{
+    "amount": 10000,
+    "currency": "USD",
+    "customerId": "cust_123",
+    "paymentMethod": "CREDIT_CARD",
+    "card": {
+      "token": "tok_visa_4242"
+    }
+  }')
+
+# 2. Extract transaction ID
+TRANSACTION_ID=$(echo $RESPONSE | jq -r '.transactionId')
+
+# 3. Check payment status
+curl -X GET "https://api.payment-orchestration.com/v1/payments/$TRANSACTION_ID" \
+  -H "Authorization: Bearer sk_live_abc123xyz789"
+
+# 4. Get audit trail
+curl -X GET "https://api.payment-orchestration.com/v1/audit/payments/$TRANSACTION_ID/events" \
+  -H "Authorization: Bearer sk_live_abc123xyz789"
 ```
 
-### 5.4 Version Support Matrix
+### 10.2 Error Handling Example
 
-| Version | Status | Released | Deprecated | Sunset |
-|---------|--------|----------|------------|--------|
-| v1 | Current | 2026-04-09 | - | - |
-| v2 | Planned | 2027-01-01 | - | - |
-
-### 5.5 Field Evolution Strategy
-
-**Adding Optional Fields** (Non-Breaking):
-```json
-// v1 Response
-{
-  "transaction_id": "txn_123",
-  "status": "succeeded",
-  "amount": 10000
+```kotlin
+suspend fun createPayment(request: CreatePaymentRequest): Result<Payment> {
+    return try {
+        val response = httpClient.post("/api/v1/payments") {
+            header("Authorization", "Bearer $apiKey")
+            header("Idempotency-Key", request.idempotencyKey)
+            contentType(ContentType.Application.Json)
+            setBody(request)
+        }
+        
+        when (response.status) {
+            HttpStatusCode.Created -> Result.success(response.body())
+            HttpStatusCode.BadRequest -> {
+                val error: ErrorResponse = response.body()
+                Result.failure(ValidationException(error.message))
+            }
+            HttpStatusCode.Conflict -> {
+                // Idempotency conflict - poll status
+                val transactionId = response.body<ErrorResponse>().transactionId
+                pollPaymentStatus(transactionId)
+            }
+            HttpStatusCode.TooManyRequests -> {
+                val retryAfter = response.headers["Retry-After"]?.toInt() ?: 60
+                delay(retryAfter * 1000L)
+                createPayment(request) // Retry
+            }
+            else -> Result.failure(ApiException("Unexpected error"))
+        }
+    } catch (e: Exception) {
+        Result.failure(e)
+    }
 }
-
-// v1 Response (with new optional field)
-{
-  "transaction_id": "txn_123",
-  "status": "succeeded",
-  "amount": 10000,
-  "fees": {  // NEW: Optional field added
-    "total_fee": 320
-  }
-}
-```
-
-**Deprecating Fields** (Breaking - requires v2):
-```json
-// v1 Response
-{
-  "transaction_id": "txn_123",
-  "status": "succeeded",
-  "provider_id": "stripe"  // DEPRECATED
-}
-
-// v2 Response
-{
-  "transaction_id": "txn_123",
-  "status": "succeeded",
-  "provider": {  // NEW: Replaces provider_id
-    "id": "stripe",
-    "name": "Stripe",
-    "type": "card_processor"
-  }
-}
-```
-
-### 5.6 Client Library Versioning
-
-**Recommended Client Library Versions**:
-- Node.js: `@payment-orchestration/node@^1.0.0`
-- Python: `payment-orchestration==1.0.0`
-- Java: `com.payment-orchestration:client:1.0.0`
-- Ruby: `payment-orchestration ~> 1.0`
-
-**Version Compatibility**:
-```yaml
-client_library_v1:
-  compatible_api_versions: ["v1"]
-  minimum_api_version: "v1.0.0"
-  
-client_library_v2:
-  compatible_api_versions: ["v1", "v2"]
-  minimum_api_version: "v1.0.0"
 ```
 
 ---
 
-## 6. API Design Principles
+## Appendix
 
-### 6.1 RESTful Design
+### A. Supported Currencies
 
-**Resource-Oriented**:
-- Resources are nouns (payments, not createPayment)
-- Use HTTP methods for actions (POST, GET, PUT, DELETE)
-- Use HTTP status codes correctly
+USD, EUR, GBP, CAD, AUD, JPY, CNY, INR, SGD, HKD, CHF, SEK, NOK, DKK, PLN, CZK, HUF, RON, BGN, HRK, RUB, TRY, BRL, MXN, ARS, CLP, COP, PEN, ZAR, NGN, KES, EGP, AED, SAR, QAR, KWD, BHD, OMR, JOD, ILS, THB, MYR, IDR, PHP, VND, KRW, TWD, NZD
 
-**URL Structure**:
-```
-/api/v1/payments                    # Collection
-/api/v1/payments/{transaction_id}   # Individual resource
-/api/v1/payments/{transaction_id}/refunds  # Sub-resource
-```
+### B. Supported Payment Methods
 
-### 6.2 Consistency
+- CREDIT_CARD (Visa, Mastercard, Amex, Discover)
+- DEBIT_CARD
+- BANK_TRANSFER (ACH, SEPA, BACS)
+- DIGITAL_WALLET (Apple Pay, Google Pay)
 
-**Naming Conventions**:
-- Use snake_case for field names
-- Use lowercase for URLs
-- Use plural nouns for collections
-- Use consistent terminology across API
+### C. Contact & Support
 
-**Timestamp Format**:
-- Always use ISO 8601 format
-- Always use UTC timezone
-- Format: `2026-04-09T05:00:00.000Z`
-
-**Currency Amounts**:
-- Always use smallest currency unit (cents)
-- Always use integers (no decimals)
-- Always include currency code
-
-### 6.3 Security
-
-**Authentication**:
-- API keys for server-to-server
-- JWT tokens for user-facing APIs
-- Always use HTTPS (TLS 1.3)
-
-**Data Protection**:
-- Never return sensitive data (full card numbers, CVV)
-- Mask sensitive data in logs
-- Use tokenization for card data
-
-**Rate Limiting**:
-- Implement per-key rate limits
-- Return rate limit headers
-- Use 429 status code when exceeded
-
-### 6.4 Performance
-
-**Pagination** (for future list endpoints):
-```http
-GET /api/v1/payments?limit=100&starting_after=txn_123
-```
-
-**Filtering** (for future list endpoints):
-```http
-GET /api/v1/payments?status=succeeded&created_after=2026-04-01
-```
-
-**Field Selection** (for future optimization):
-```http
-GET /api/v1/payments/txn_123?fields=transaction_id,status,amount
-```
+- **API Documentation**: https://docs.payment-orchestration.com
+- **Support Email**: api-support@payment-orchestration.com
+- **Status Page**: https://status.payment-orchestration.com
+- **GitHub**: https://github.com/payment-orchestration/api
 
 ---
 
-## 7. OpenAPI Specification
-
-### 7.1 OpenAPI 3.0 Schema (Excerpt)
-
-```yaml
-openapi: 3.0.3
-info:
-  title: Payment Orchestration API
-  version: 1.0.0
-  description: API for processing payments through multiple payment providers
-  contact:
-    name: API Support
-    email: api-support@payment-orchestration.com
-    url: https://docs.payment-orchestration.com
-
-servers:
-  - url: https://api.payment-orchestration.com/api/v1
-    description: Production
-  - url: https://sandbox.payment-orchestration.com/api/v1
-    description: Sandbox
-
-security:
-  - ApiKeyAuth: []
-  - BearerAuth: []
-
-paths:
-  /payments:
-    post:
-      summary: Create Payment
-      operationId: createPayment
-      tags:
-        - Payments
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CreatePaymentRequest'
-      responses:
-        '201':
-          description: Payment created successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Payment'
-        '400':
-          description: Bad request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-
-  /payments/{transaction_id}:
-    get:
-      summary: Fetch Payment
-      operationId: fetchPayment
-      tags:
-        - Payments
-      parameters:
-        - name: transaction_id
-          in: path
-          required: true
-          schema:
-            type: string
-            pattern: '^txn_[a-zA-Z0-9]{10,}$'
-        - name: include_events
-          in: query
-          schema:
-            type: boolean
-            default: false
-        - name: include_retry_context
-          in: query
-          schema:
-            type: boolean
-            default: false
-      responses:
-        '200':
-          description: Payment retrieved successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Payment'
-        '404':
-          description: Payment not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-
-components:
-  securitySchemes:
-    ApiKeyAuth:
-      type: apiKey
-      in: header
-      name: Authorization
-      description: API key authentication (format: Bearer sk_live_...)
-    
-    BearerAuth:
-      type: http
-      scheme: bearer
-      bearerFormat: JWT
-
-  schemas:
-    CreatePaymentRequest:
-      type: object
-      required:
-        - amount
-        - currency
-        - payment_method
-      properties:
-        amount:
-          type: integer
-          minimum: 50
-          maximum: 99999999999
-          description: Amount in smallest currency unit
-        currency:
-          type: string
-          pattern: '^[A-Z]{3}$'
-          enum: [USD, EUR, GBP, JPY, CAD, AUD, CHF, CNY, INR]
-        payment_method:
-          $ref: '#/components/schemas/PaymentMethod'
-        idempotency_key:
-          type: string
-          maxLength: 255
-        customer_id:
-          type: string
-          maxLength: 255
-        customer_email:
-          type: string
-          format: email
-          maxLength: 255
-        metadata:
-          type: object
-          maxProperties: 50
-
-    Payment:
-      type: object
-      properties:
-        transaction_id:
-          type: string
-          pattern: '^txn_[a-zA-Z0-9]{10,}$'
-        status:
-          type: string
-          enum: [initiated, routing, processing, pending, succeeded, failed, retrying, cancelled]
-        amount:
-          type: integer
-        currency:
-          type: string
-        payment_method:
-          $ref: '#/components/schemas/PaymentMethodSummary'
-        provider:
-          type: string
-        provider_transaction_id:
-          type: string
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
-        metadata:
-          type: object
-
-    Error:
-      type: object
-      required:
-        - error
-      properties:
-        error:
-          type: object
-          required:
-            - code
-            - message
-            - type
-          properties:
-            code:
-              type: string
-            message:
-              type: string
-            type:
-              type: string
-            param:
-              type: string
-            details:
-              type: array
-              items:
-                type: object
-            request_id:
-              type: string
-            documentation_url:
-              type: string
-```
-
----
-
-## 8. Summary
-
-### 8.1 Key Design Decisions
-
-✅ **Domain Models**: Clear, well-defined models with validation rules  
-✅ **Status Lifecycle**: 8-state state machine with clear transitions  
-✅ **REST API**: Resource-oriented design following REST principles  
-✅ **Error Handling**: Comprehensive error taxonomy with retry guidance  
-✅ **Versioning**: URL-based versioning with clear compatibility rules  
-✅ **Security**: API key authentication, data masking, rate limiting  
-✅ **Idempotency**: Built-in support via headers or request body  
-✅ **Backward Compatibility**: Clear rules for breaking vs non-breaking changes
-
-### 8.2 API Maturity
-
-**Current State**: Level 2 (HTTP Verbs + Status Codes)
-
-**Future Enhancements**:
-- Level 3: HATEOAS (Hypermedia controls)
-- GraphQL endpoint for flexible queries
-- Webhook management API
-- Batch payment processing
-- Subscription management
-
-### 8.3 Documentation
-
-**Available Resources**:
-- API Reference: https://docs.payment-orchestration.com/api
-- OpenAPI Spec: https://api.payment-orchestration.com/openapi.json
-- Postman Collection: https://docs.payment-orchestration.com/postman
-- Client Libraries: https://docs.payment-orchestration.com/libraries
-- Migration Guides: https://docs.payment-orchestration.com/migration
-
----
-
-**Document Version**: 1.0.0  
 **Last Updated**: 2026-04-09  
-**Status**: Ready for Implementation  
-**Next Steps**: Generate OpenAPI spec, implement API endpoints, create client libraries
+**Document Version**: 1.0.0
