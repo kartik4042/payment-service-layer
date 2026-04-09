@@ -810,27 +810,6 @@ suspend fun createPayment(request: CreatePaymentRequest): Result<Payment> {
 
 ---
 
-## Appendix
-
-### A. Supported Currencies
-
-USD, EUR, GBP, CAD, AUD, JPY, CNY, INR, SGD, HKD, CHF, SEK, NOK, DKK, PLN, CZK, HUF, RON, BGN, HRK, RUB, TRY, BRL, MXN, ARS, CLP, COP, PEN, ZAR, NGN, KES, EGP, AED, SAR, QAR, KWD, BHD, OMR, JOD, ILS, THB, MYR, IDR, PHP, VND, KRW, TWD, NZD
-
-### B. Supported Payment Methods
-
-- CREDIT_CARD (Visa, Mastercard, Amex, Discover)
-- DEBIT_CARD
-- BANK_TRANSFER (ACH, SEPA, BACS)
-- DIGITAL_WALLET (Apple Pay, Google Pay)
-
-### C. Contact & Support
-
-- **API Documentation**: https://docs.payment-orchestration.com
-- **Support Email**: api-support@payment-orchestration.com
-- **Status Page**: https://status.payment-orchestration.com
-- **GitHub**: https://github.com/payment-orchestration/api
-
----
 
 **Last Updated**: 2026-04-09  
 **Document Version**: 1.0.0
