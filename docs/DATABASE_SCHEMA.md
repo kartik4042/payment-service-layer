@@ -1,8 +1,4 @@
-===================================================================
---- /dev/null
-+++ payment/DATABASE_SCHEMA.md
-@@ -0,0 +1,1354 @@
-+# Payment Orchestration System - Database Schema Design
+# Payment Orchestration System - Database Schema Design
 +
 +## Document Information
 +- **Version**: 1.0.0
