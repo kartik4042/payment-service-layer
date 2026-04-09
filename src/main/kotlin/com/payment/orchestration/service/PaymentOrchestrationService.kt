@@ -46,10 +46,10 @@ import java.time.Instant
 class PaymentOrchestrationService(
     private val routingEngine: RoutingEngine,
     private val retryManager: RetryManager,
-    private val failoverManager: FailoverManager
-    // private val paymentRepository: PaymentRepository - to be added
-    // private val idempotencyStore: IdempotencyStore - to be added
-    // private val eventPublisher: EventPublisher - to be added
+    private val failoverManager: FailoverManager,
+    private val paymentRepository: com.payment.orchestration.repository.PaymentRepositoryAdapter,
+    private val idempotencyService: com.payment.orchestration.idempotency.IdempotencyService,
+    private val eventPublisher: com.payment.orchestration.events.EventPublisher
 ) {
     private val logger = LoggerFactory.getLogger(PaymentOrchestrationService::class.java)
     
@@ -86,9 +86,18 @@ class PaymentOrchestrationService(
             // Step 1: Validate payment
             validatePayment(currentPayment)
             
-            // Step 2: Check idempotency (to be implemented)
-            // val existingPayment = checkIdempotency(currentPayment)
-            // if (existingPayment != null) return existingPayment
+            // Step 2: Check idempotency
+            val existingPayment = idempotencyService.checkIdempotency(
+                currentPayment.transactionId,
+                currentPayment.transaction
+            )
+            if (existingPayment != null) {
+                logger.info(
+                    "Returning existing payment from idempotency check: transactionId={}",
+                    existingPayment.transactionId
+                )
+                return existingPayment
+            }
             
             // Step 3: Transition to ROUTING state
             currentPayment = transitionToRouting(currentPayment)
@@ -119,11 +128,14 @@ class PaymentOrchestrationService(
                 handleFailure(currentPayment, retryResult, selectedProvider)
             }
             
-            // Step 8: Persist payment (to be implemented)
-            // currentPayment = paymentRepository.save(currentPayment)
+            // Step 8: Persist payment
+            currentPayment = paymentRepository.save(currentPayment)
             
-            // Step 9: Publish events (to be implemented)
-            // publishPaymentEvent(currentPayment)
+            // Step 9: Mark idempotency as completed
+            idempotencyService.markCompleted(currentPayment.transactionId)
+            
+            // Step 10: Publish events
+            publishPaymentEvent(currentPayment)
             
             logger.info(
                 "Payment orchestration completed: transactionId={}, status={}, provider={}",
@@ -144,8 +156,11 @@ class PaymentOrchestrationService(
             // Transition to FAILED state
             currentPayment = transitionToFailed(currentPayment, e.message ?: "Unknown error")
             
-            // Persist failure (to be implemented)
-            // paymentRepository.save(currentPayment)
+            // Persist failure
+            currentPayment = paymentRepository.save(currentPayment)
+            
+            // Mark idempotency as failed (allows retry)
+            idempotencyService.markFailed(currentPayment.transactionId)
             
             return currentPayment
         }
@@ -345,12 +360,8 @@ class PaymentOrchestrationService(
     fun getPayment(transactionId: String): Payment {
         logger.debug("Retrieving payment: transactionId={}", transactionId)
         
-        // In production, fetch from repository
-        // return paymentRepository.findByTransactionId(transactionId)
-        //     ?: throw PaymentNotFoundException("Payment not found: $transactionId")
-        
-        // For now, throw not implemented
-        throw NotImplementedError("Payment retrieval not yet implemented")
+        return paymentRepository.findByTransactionId(transactionId)
+            ?: throw PaymentNotFoundException("Payment not found: $transactionId")
     }
     
     /**
@@ -375,13 +386,78 @@ class PaymentOrchestrationService(
         
         // Transition to CANCELLED
         val cancelledPayment = payment.copy(
+    
+    /**
+     * Publishes payment event based on payment status.
+     * 
+     * @param payment The payment to publish event for
+     */
+    private fun publishPaymentEvent(payment: Payment) {
+        val event = when (payment.status) {
+            PaymentStatus.INITIATED -> com.payment.orchestration.events.PaymentEvent.PaymentCreated(
+                eventId = java.util.UUID.randomUUID().toString(),
+                timestamp = Instant.now(),
+                paymentId = payment.id,
+                transactionId = payment.transactionId,
+                aggregateVersion = 1,
+                customerId = payment.customerId,
+                merchantId = payment.merchantId,
+                amount = payment.transaction.amount,
+                currency = payment.transaction.currency,
+                paymentMethod = payment.transaction.paymentMethod,
+                provider = payment.selectedProvider,
+                description = payment.transaction.description,
+                metadata = payment.metadata
+            )
+            PaymentStatus.SUCCEEDED -> com.payment.orchestration.events.PaymentEvent.PaymentSucceeded(
+                eventId = java.util.UUID.randomUUID().toString(),
+                timestamp = Instant.now(),
+                paymentId = payment.id,
+                transactionId = payment.transactionId,
+                aggregateVersion = 2,
+                provider = payment.selectedProvider!!,
+                providerTransactionId = payment.providerTransactionId,
+                providerStatus = payment.providerStatus,
+                completedAt = payment.completedAt!!,
+                metadata = payment.metadata
+            )
+            PaymentStatus.FAILED -> com.payment.orchestration.events.PaymentEvent.PaymentFailed(
+                eventId = java.util.UUID.randomUUID().toString(),
+                timestamp = Instant.now(),
+                paymentId = payment.id,
+                transactionId = payment.transactionId,
+                aggregateVersion = 2,
+                provider = payment.selectedProvider,
+                reason = payment.failureReason ?: "Unknown error",
+                errorCode = "PAYMENT_FAILED",
+                retryable = false,
+                metadata = payment.metadata
+            )
+            PaymentStatus.CANCELLED -> com.payment.orchestration.events.PaymentEvent.PaymentCancelled(
+                eventId = java.util.UUID.randomUUID().toString(),
+                timestamp = Instant.now(),
+                paymentId = payment.id,
+                transactionId = payment.transactionId,
+                aggregateVersion = 2,
+                reason = "Cancelled by user",
+                cancelledBy = "system",
+                metadata = payment.metadata
+            )
+            else -> {
+                logger.debug("No event to publish for status: {}", payment.status)
+                return
+            }
+        }
+        
+        eventPublisher.publish(event)
+    }
             status = PaymentStatus.CANCELLED,
             completedAt = Instant.now(),
             updatedAt = Instant.now()
         )
         
-        // Persist (to be implemented)
-        // paymentRepository.save(cancelledPayment)
+        // Persist
+        paymentRepository.save(cancelledPayment)
         
         logger.info("Payment cancelled: transactionId={}", transactionId)
         

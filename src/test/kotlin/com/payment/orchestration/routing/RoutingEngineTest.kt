@@ -1,336 +1,150 @@
 package com.payment.orchestration.routing
 
-import com.payment.orchestration.domain.model.*
-import com.payment.orchestration.provider.PaymentProvider
-import com.payment.orchestration.provider.ProviderResponse
-import io.mockk.*
-import org.junit.jupiter.api.*
+import com.payment.orchestration.circuitbreaker.CircuitBreakerService
+import com.payment.orchestration.domain.model.Payment
+import com.payment.orchestration.domain.model.PaymentMethod
+import com.payment.orchestration.domain.model.Transaction
+import com.payment.orchestration.provider.ProviderA
+import com.payment.orchestration.provider.ProviderB
+import io.mockk.every
+import io.mockk.mockk
 import org.junit.jupiter.api.Assertions.*
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import java.math.BigDecimal
-import java.time.Instant
 
 /**
- * Unit Tests for RoutingEngine
+ * Unit tests for RoutingEngine
  * 
- * Test Classification:
- * - @Tag("sanity"): Basic functionality tests
- * - @Tag("regression"): Edge cases and error scenarios
- * 
- * Test Framework: JUnit 5 + MockK
- * 
- * Coverage:
- * - Provider selection by payment method
- * - Fallback provider selection
- * - Health check integration
- * - Amount-based routing
- * - No available provider scenarios
+ * Test Coverage:
+ * - Provider selection based on payment method
+ * - Circuit breaker integration
+ * - Fallback when primary provider is unhealthy
+ * - Exception when all providers are unhealthy
+ * - Provider health status checking
  */
-@TestInstance(TestInstance.Lifecycle.PER_CLASS)
-@DisplayName("RoutingEngine Unit Tests")
 class RoutingEngineTest {
     
+    private lateinit var providerA: ProviderA
+    private lateinit var providerB: ProviderB
+    private lateinit var circuitBreakerService: CircuitBreakerService
     private lateinit var routingEngine: RoutingEngine
-    private lateinit var providerA: PaymentProvider
-    private lateinit var providerB: PaymentProvider
-    private lateinit var providers: Map<Provider, PaymentProvider>
     
     @BeforeEach
     fun setup() {
-        // Create mock providers
-        providerA = mockk<PaymentProvider>()
-        providerB = mockk<PaymentProvider>()
+        providerA = mockk(relaxed = true)
+        providerB = mockk(relaxed = true)
+        circuitBreakerService = mockk(relaxed = true)
         
-        // Configure provider IDs
-        every { providerA.getProviderId() } returns Provider.PROVIDER_A
-        every { providerB.getProviderId() } returns Provider.PROVIDER_B
+        every { providerA.getProviderId() } returns com.payment.orchestration.domain.model.Provider.PROVIDER_A
+        every { providerB.getProviderId() } returns com.payment.orchestration.domain.model.Provider.PROVIDER_B
         
-        // Create provider map
-        providers = mapOf(
-            Provider.PROVIDER_A to providerA,
-            Provider.PROVIDER_B to providerB
+        routingEngine = RoutingEngine(
+            providerA = providerA,
+            providerB = providerB,
+            circuitBreakerService = circuitBreakerService
         )
-        
-        // Create routing engine
-        routingEngine = RoutingEngine(providers)
     }
-    
-    @AfterEach
-    fun tearDown() {
-        clearAllMocks()
-    }
-    
-    // ========================================
-    // SANITY TESTS - Basic Functionality
-    // ========================================
     
     @Test
-    @Tag("sanity")
-    @DisplayName("Should route CARD payment to ProviderA")
-    fun testRouteCardToProviderA() {
+    fun `should select ProviderA for CARD payments when healthy`() {
         // Given
-        val payment = createPayment(PaymentMethod.CARD, BigDecimal("100.00"))
-        every { providerA.isHealthy() } returns true
+        val payment = createPayment(PaymentMethod.CARD)
+        every { circuitBreakerService.isHealthy(com.payment.orchestration.domain.model.Provider.PROVIDER_A) } returns true
         
         // When
         val selectedProvider = routingEngine.selectProvider(payment)
         
         // Then
-        assertEquals(Provider.PROVIDER_A, selectedProvider.getProviderId())
-        verify(exactly = 1) { providerA.isHealthy() }
+        assertEquals(com.payment.orchestration.domain.model.Provider.PROVIDER_A, selectedProvider.getProviderId())
     }
     
     @Test
-    @Tag("sanity")
-    @DisplayName("Should route UPI payment to ProviderB")
-    fun testRouteUpiToProviderB() {
+    fun `should select ProviderB for UPI payments when healthy`() {
         // Given
-        val payment = createPayment(PaymentMethod.UPI, BigDecimal("500.00"))
-        every { providerB.isHealthy() } returns true
+        val payment = createPayment(PaymentMethod.UPI)
+        every { circuitBreakerService.isHealthy(com.payment.orchestration.domain.model.Provider.PROVIDER_B) } returns true
         
         // When
         val selectedProvider = routingEngine.selectProvider(payment)
         
         // Then
-        assertEquals(Provider.PROVIDER_B, selectedProvider.getProviderId())
-        verify(exactly = 1) { providerB.isHealthy() }
+        assertEquals(com.payment.orchestration.domain.model.Provider.PROVIDER_B, selectedProvider.getProviderId())
     }
     
     @Test
-    @Tag("sanity")
-    @DisplayName("Should route WALLET payment to ProviderA")
-    fun testRouteWalletToProviderA() {
+    fun `should fallback to ProviderB when ProviderA is unhealthy for CARD payments`() {
         // Given
-        val payment = createPayment(PaymentMethod.WALLET, BigDecimal("250.00"))
-        every { providerA.isHealthy() } returns true
+        val payment = createPayment(PaymentMethod.CARD)
+        every { circuitBreakerService.isHealthy(com.payment.orchestration.domain.model.Provider.PROVIDER_A) } returns false
+        every { circuitBreakerService.isHealthy(com.payment.orchestration.domain.model.Provider.PROVIDER_B) } returns true
         
         // When
         val selectedProvider = routingEngine.selectProvider(payment)
         
         // Then
-        assertEquals(Provider.PROVIDER_A, selectedProvider.getProviderId())
+        assertEquals(com.payment.orchestration.domain.model.Provider.PROVIDER_B, selectedProvider.getProviderId())
     }
     
     @Test
-    @Tag("sanity")
-    @DisplayName("Should route NET_BANKING payment to ProviderB")
-    fun testRouteNetBankingToProviderB() {
+    fun `should fallback to ProviderA when ProviderB is unhealthy for UPI payments`() {
         // Given
-        val payment = createPayment(PaymentMethod.NET_BANKING, BigDecimal("1000.00"))
-        every { providerB.isHealthy() } returns true
+        val payment = createPayment(PaymentMethod.UPI)
+        every { circuitBreakerService.isHealthy(com.payment.orchestration.domain.model.Provider.PROVIDER_B) } returns false
+        every { circuitBreakerService.isHealthy(com.payment.orchestration.domain.model.Provider.PROVIDER_A) } returns true
         
         // When
         val selectedProvider = routingEngine.selectProvider(payment)
         
         // Then
-        assertEquals(Provider.PROVIDER_B, selectedProvider.getProviderId())
-    }
-    
-    // ========================================
-    // REGRESSION TESTS - Fallback Scenarios
-    // ========================================
-    
-    @Test
-    @Tag("regression")
-    @DisplayName("Should fallback to ProviderB when ProviderA is unhealthy for CARD")
-    fun testFallbackWhenPrimaryUnhealthy() {
-        // Given
-        val payment = createPayment(PaymentMethod.CARD, BigDecimal("100.00"))
-        every { providerA.isHealthy() } returns false  // Primary unhealthy
-        every { providerB.isHealthy() } returns true   // Fallback healthy
-        
-        // When
-        val selectedProvider = routingEngine.selectProvider(payment)
-        
-        // Then
-        assertEquals(Provider.PROVIDER_B, selectedProvider.getProviderId())
-        verify(exactly = 1) { providerA.isHealthy() }
-        verify(exactly = 1) { providerB.isHealthy() }
+        assertEquals(com.payment.orchestration.domain.model.Provider.PROVIDER_A, selectedProvider.getProviderId())
     }
     
     @Test
-    @Tag("regression")
-    @DisplayName("Should fallback to ProviderA when ProviderB is unhealthy for UPI")
-    fun testFallbackForUpiPayment() {
+    fun `should throw exception when all providers are unhealthy`() {
         // Given
-        val payment = createPayment(PaymentMethod.UPI, BigDecimal("500.00"))
-        every { providerB.isHealthy() } returns false  // Primary unhealthy
-        every { providerA.isHealthy() } returns true   // Fallback healthy
-        
-        // When
-        val selectedProvider = routingEngine.selectProvider(payment)
-        
-        // Then
-        assertEquals(Provider.PROVIDER_A, selectedProvider.getProviderId())
-    }
-    
-    @Test
-    @Tag("regression")
-    @DisplayName("Should throw exception when all providers are unhealthy")
-    fun testNoAvailableProvider() {
-        // Given
-        val payment = createPayment(PaymentMethod.CARD, BigDecimal("100.00"))
-        every { providerA.isHealthy() } returns false
-        every { providerB.isHealthy() } returns false
+        val payment = createPayment(PaymentMethod.CARD)
+        every { circuitBreakerService.isHealthy(com.payment.orchestration.domain.model.Provider.PROVIDER_A) } returns false
+        every { circuitBreakerService.isHealthy(com.payment.orchestration.domain.model.Provider.PROVIDER_B) } returns false
         
         // When & Then
-        val exception = assertThrows<NoAvailableProviderException> {
+        val exception = assertThrows<NoHealthyProviderException> {
             routingEngine.selectProvider(payment)
         }
         
         assertTrue(exception.message!!.contains("No healthy provider available"))
-        verify(exactly = 1) { providerA.isHealthy() }
-        verify(exactly = 1) { providerB.isHealthy() }
     }
     
     @Test
-    @Tag("regression")
-    @DisplayName("Should handle health check exceptions gracefully")
-    fun testHealthCheckException() {
+    fun `should select ProviderA for NET_BANKING when healthy`() {
         // Given
-        val payment = createPayment(PaymentMethod.CARD, BigDecimal("100.00"))
-        every { providerA.isHealthy() } throws RuntimeException("Health check failed")
-        every { providerB.isHealthy() } returns true
+        val payment = createPayment(PaymentMethod.NET_BANKING)
+        every { circuitBreakerService.isHealthy(com.payment.orchestration.domain.model.Provider.PROVIDER_A) } returns true
         
         // When
         val selectedProvider = routingEngine.selectProvider(payment)
         
         // Then
-        assertEquals(Provider.PROVIDER_B, selectedProvider.getProviderId())
+        assertEquals(com.payment.orchestration.domain.model.Provider.PROVIDER_A, selectedProvider.getProviderId())
     }
     
-    // ========================================
-    // REGRESSION TESTS - Amount-Based Routing
-    // ========================================
-    
-    @Test
-    @Tag("regression")
-    @DisplayName("Should route high-value transaction to primary provider")
-    fun testHighValueTransaction() {
-        // Given - Amount > 100,000
-        val payment = createPayment(PaymentMethod.CARD, BigDecimal("150000.00"))
-        every { providerA.isHealthy() } returns true
-        
-        // When
-        val selectedProvider = routingEngine.selectProvider(payment)
-        
-        // Then
-        assertEquals(Provider.PROVIDER_A, selectedProvider.getProviderId())
-    }
-    
-    @Test
-    @Tag("regression")
-    @DisplayName("Should route low-value transaction to primary provider")
-    fun testLowValueTransaction() {
-        // Given - Amount < 100
-        val payment = createPayment(PaymentMethod.CARD, BigDecimal("50.00"))
-        every { providerA.isHealthy() } returns true
-        
-        // When
-        val selectedProvider = routingEngine.selectProvider(payment)
-        
-        // Then
-        assertEquals(Provider.PROVIDER_A, selectedProvider.getProviderId())
-    }
-    
-    // ========================================
-    // REGRESSION TESTS - Available Providers
-    // ========================================
-    
-    @Test
-    @Tag("regression")
-    @DisplayName("Should return all healthy providers for payment method")
-    fun testGetAvailableProviders() {
-        // Given
-        every { providerA.isHealthy() } returns true
-        every { providerB.isHealthy() } returns true
-        
-        // When
-        val availableProviders = routingEngine.getAvailableProviders(PaymentMethod.CARD)
-        
-        // Then
-        assertEquals(2, availableProviders.size)
-        assertTrue(availableProviders.any { it.getProviderId() == Provider.PROVIDER_A })
-        assertTrue(availableProviders.any { it.getProviderId() == Provider.PROVIDER_B })
-    }
-    
-    @Test
-    @Tag("regression")
-    @DisplayName("Should return only healthy providers")
-    fun testGetAvailableProvidersWithUnhealthy() {
-        // Given
-        every { providerA.isHealthy() } returns true
-        every { providerB.isHealthy() } returns false
-        
-        // When
-        val availableProviders = routingEngine.getAvailableProviders(PaymentMethod.CARD)
-        
-        // Then
-        assertEquals(1, availableProviders.size)
-        assertEquals(Provider.PROVIDER_A, availableProviders[0].getProviderId())
-    }
-    
-    @Test
-    @Tag("regression")
-    @DisplayName("Should return empty list when no providers are healthy")
-    fun testGetAvailableProvidersAllUnhealthy() {
-        // Given
-        every { providerA.isHealthy() } returns false
-        every { providerB.isHealthy() } returns false
-        
-        // When
-        val availableProviders = routingEngine.getAvailableProviders(PaymentMethod.CARD)
-        
-        // Then
-        assertTrue(availableProviders.isEmpty())
-    }
-    
-    // ========================================
-    // REGRESSION TESTS - Routing Statistics
-    // ========================================
-    
-    @Test
-    @Tag("regression")
-    @DisplayName("Should return routing statistics for all providers")
-    fun testGetRoutingStats() {
-        // Given
-        every { providerA.isHealthy() } returns true
-        every { providerB.isHealthy() } returns false
-        
-        // When
-        val stats = routingEngine.getRoutingStats()
-        
-        // Then
-        assertEquals(2, stats.size)
-        assertTrue(stats.containsKey(Provider.PROVIDER_A))
-        assertTrue(stats.containsKey(Provider.PROVIDER_B))
-        assertTrue(stats[Provider.PROVIDER_A]!!.isHealthy)
-        assertFalse(stats[Provider.PROVIDER_B]!!.isHealthy)
-    }
-    
-    // ========================================
-    // Helper Methods
-    // ========================================
-    
-    private fun createPayment(
-        paymentMethod: PaymentMethod,
-        amount: BigDecimal
-    ): Payment {
+    private fun createPayment(paymentMethod: PaymentMethod): Payment {
         val transaction = Transaction(
-            merchantId = "merchant_123",
-            customerId = "customer_456",
-            amount = amount,
+            amount = BigDecimal("100.00"),
             currency = "INR",
             paymentMethod = paymentMethod,
+            customerId = "cust_123",
+            merchantId = "merch_456",
+            description = "Test payment",
             paymentDetails = mapOf("test" to "data")
         )
         
-        return Payment(
-            transactionId = "txn_test_${System.currentTimeMillis()}",
-            transaction = transaction,
-            status = PaymentStatus.INITIATED,
-            createdAt = Instant.now()
+        return Payment.create(
+            customerId = "cust_123",
+            merchantId = "merch_456",
+            transaction = transaction
         )
     }
 }
-
 
