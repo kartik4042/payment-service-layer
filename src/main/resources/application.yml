@@ -1,0 +1,206 @@
+spring:
+  application:
+    name: payment-orchestration-service
+  
+  # Database Configuration
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:payment_orchestration}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      pool-name: PaymentHikariPool
+  
+  # JPA Configuration
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+        use_sql_comments: true
+        jdbc:
+          batch_size: 20
+        order_inserts: true
+        order_updates: true
+  
+  # Redis Configuration
+  redis:
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:6379}
+    password: ${REDIS_PASSWORD:}
+    timeout: 2000ms
+    lettuce:
+      pool:
+        max-active: 8
+        max-idle: 8
+        min-idle: 2
+        max-wait: -1ms
+  
+  # Flyway Migration
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+    validate-on-migrate: true
+  
+  # Zipkin Tracing
+  zipkin:
+    base-url: ${ZIPKIN_URL:http://localhost:9411}
+    enabled: ${ZIPKIN_ENABLED:true}
+  
+  sleuth:
+    sampler:
+      probability: ${TRACE_SAMPLE_RATE:1.0}
+
+# Server Configuration
+server:
+  port: ${SERVER_PORT:8080}
+  compression:
+    enabled: true
+  error:
+    include-message: always
+    include-binding-errors: always
+
+# Management & Actuator
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,circuitbreakers
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+  health:
+    circuitbreakers:
+      enabled: true
+    ratelimiters:
+      enabled: true
+
+# Resilience4j Circuit Breaker
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+        record-exceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+    instances:
+      providerA:
+        base-config: default
+      providerB:
+        base-config: default
+  
+  retry:
+    configs:
+      default:
+        max-attempts: 3
+        wait-duration: 1s
+        retry-exceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+    instances:
+      paymentRetry:
+        base-config: default
+
+# Application Configuration
+payment:
+  orchestration:
+    # Provider Configuration
+    providers:
+      providerA:
+        name: "Provider A"
+        base-url: ${PROVIDER_A_URL:http://localhost:8081}
+        api-key: ${PROVIDER_A_API_KEY:test-key-a}
+        timeout: 5000
+        enabled: true
+        priority: 1
+        supported-countries:
+          - US
+          - CA
+          - GB
+          - DE
+          - FR
+      providerB:
+        name: "Provider B"
+        base-url: ${PROVIDER_B_URL:http://localhost:8082}
+        api-key: ${PROVIDER_B_API_KEY:test-key-b}
+        timeout: 5000
+        enabled: true
+        priority: 2
+        supported-countries:
+          - IN
+          - SG
+          - AU
+          - JP
+          - CN
+    
+    # Routing Configuration
+    routing:
+      strategy: GEOGRAPHIC
+      fallback-enabled: true
+      health-check-interval: 30s
+    
+    # Retry Configuration
+    retry:
+      max-attempts: 3
+      initial-delay: 1000
+      max-delay: 10000
+      multiplier: 2.0
+    
+    # Idempotency Configuration
+    idempotency:
+      ttl: 86400 # 24 hours in seconds
+      enabled: true
+    
+    # Webhook Configuration
+    webhook:
+      secret: ${WEBHOOK_SECRET:your-webhook-secret-key}
+      signature-header: X-Payment-Signature
+      timestamp-header: X-Payment-Timestamp
+      replay-window: 300 # 5 minutes in seconds
+    
+    # Audit Configuration
+    audit:
+      enabled: true
+      retention-days: 2555 # 7 years
+      async: true
+
+# Logging Configuration
+logging:
+  level:
+    root: INFO
+    com.payment.orchestration: DEBUG
+    org.springframework.web: INFO
+    org.hibernate.SQL: DEBUG
+    org.hibernate.type.descriptor.sql.BasicBinder: TRACE
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+  file:
+    name: logs/payment-orchestration.log
+    max-size: 10MB
+    max-history: 30
+

@@ -211,31 +211,49 @@ sequenceDiagram
 Before you begin, ensure you have the following installed:
 
 - **Java 17+**: [Download](https://adoptium.net/)
-- **Gradle 8.5+**: [Download](https://gradle.org/install/)
 - **Docker & Docker Compose**: [Download](https://www.docker.com/get-started)
-- **PostgreSQL 14+**: (or use Docker)
-- **Redis 7+**: (or use Docker)
+- **Gradle 8.5+**: (included via wrapper - `./gradlew`)
 
-### Quick Start with Docker Compose
+### Quick Start with Docker Compose (Recommended)
 
-The fastest way to get started is using Docker Compose:
+The fastest way to get started is using Docker Compose, which sets up all required infrastructure:
 
 ```bash
 # 1. Clone the repository
 git clone https://github.com/your-org/payment-orchestration.git
 cd payment-orchestration/payment
 
-# 2. Start infrastructure (PostgreSQL, Redis, Zipkin)
+# 2. Copy environment configuration
+cp .env.example .env
+# Edit .env with your provider API keys if needed
+
+# 3. Start all services (PostgreSQL, Redis, Zipkin, Prometheus, Grafana)
 docker-compose up -d
 
-# 3. Build the application
+# 4. Verify services are running
+docker-compose ps
+
+# 5. Build the application
 ./gradlew clean build
 
-# 4. Run the application
+# 6. Run the application
 ./gradlew bootRun
 ```
 
 The application will start on `http://localhost:8080`
+
+### Access Services
+
+Once running, you can access:
+
+| Service | URL | Credentials |
+|---------|-----|-------------|
+| **Application API** | http://localhost:8080 | - |
+| **Prometheus** | http://localhost:9090 | - |
+| **Grafana** | http://localhost:3000 | admin/admin |
+| **Zipkin** | http://localhost:9411 | - |
+| **PostgreSQL** | localhost:5432 | postgres/postgres |
+| **Redis** | localhost:6379 | - |
 
 ### Manual Installation
 
@@ -368,9 +386,8 @@ payment/
 │   │   │       └── BulkRetryService.kt
 │   │   │
 │   │   └── resources/
-│   │       ├── application.yml         # Main configuration
-│   │       ├── application-dev.yml     # Dev environment
-│   │       ├── application-prod.yml    # Production environment
+│   │       ├── application.yml         # Production configuration
+│   │       ├── application-test.yml    # Test configuration
 │   │       └── db/migration/           # Flyway migrations
 │   │
 │   └── test/
@@ -383,16 +400,22 @@ payment/
 │           └── application-test.yml    # Test configuration
 │
 ├── docs/                               # Documentation
-│   ├── ARCHITECTURE_OVERVIEW.md
-│   ├── API_DESIGN.md
-│   ├── ORCHESTRATION_LOGIC.md
-│   ├── DATABASE_SCHEMA.md
-│   ├── SRE_METRICS.md
-│   └── TEST_STRATEGY.md
+│   ├── ARCHITECTURE_OVERVIEW.md        # System architecture (812 lines)
+│   ├── API_DESIGN.md                   # API reference
+│   ├── ORCHESTRATION_LOGIC.md          # Payment flow (683 lines)
+│   ├── DATABASE_SCHEMA.md              # Schema design (1,358 lines)
+│   ├── SRE_METRICS.md                  # Monitoring & SLOs
+│   ├── TEST_STRATEGY.md                # Testing approach
+│   ├── DEPLOYMENT_GUIDE.md             # Deployment guide (632 lines)
+│   ├── AI_DEVELOPMENT_GUIDE.md         # AI development process (1,247 lines)
+│   └── DESIGN_REVIEW.md                # Staff+ review (1,416 lines)
 │
-├── docker-compose.yml                  # Local development setup
-├── Dockerfile                          # Production container
-├── build.gradle.kts                    # Build configuration
+├── docker-compose.yml                  # Docker orchestration (PostgreSQL, Redis, Zipkin, Prometheus, Grafana)
+├── Dockerfile                          # Multi-stage production build
+├── .dockerignore                       # Docker build optimization
+├── prometheus.yml                      # Prometheus configuration
+├── .env.example                        # Environment variables template
+├── build.gradle.kts                    # Gradle build configuration
 └── README.md                           # This file
 ```
 
@@ -740,14 +763,19 @@ grep "txn_abc123" logs/application.log | jq
 
 Comprehensive documentation is available in the `docs/` directory:
 
-| Document | Description |
-|----------|-------------|
-| [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md) | System architecture and design decisions |
-| [API_DESIGN.md](API_DESIGN.md) | Complete API reference with examples |
-| [ORCHESTRATION_LOGIC.md](ORCHESTRATION_LOGIC.md) | Payment orchestration flow and error handling |
-| [DATABASE_SCHEMA.md](DATABASE_SCHEMA.md) | Database schema and data models |
-| [SRE_METRICS.md](SRE_METRICS.md) | SRE metrics, SLOs, and monitoring |
-| [TEST_STRATEGY.md](TEST_STRATEGY.md) | Testing strategy and test cases |
+| Document | Lines | Description |
+|----------|-------|-------------|
+| [ARCHITECTURE_OVERVIEW.md](docs/ARCHITECTURE_OVERVIEW.md) | 812 | System architecture, design decisions, and Mermaid diagrams |
+| [API_DESIGN.md](docs/API_DESIGN.md) | 450+ | Complete API reference with request/response examples |
+| [ORCHESTRATION_LOGIC.md](docs/ORCHESTRATION_LOGIC.md) | 683 | Payment orchestration flow, error handling, and Kotlin examples |
+| [DATABASE_SCHEMA.md](docs/DATABASE_SCHEMA.md) | 1,358 | Database schema, indexes, and data access patterns |
+| [SRE_METRICS.md](docs/SRE_METRICS.md) | 600+ | SRE metrics, SLOs, alerting, and monitoring dashboards |
+| [TEST_STRATEGY.md](docs/TEST_STRATEGY.md) | 500+ | Testing strategy, test pyramid, and coverage goals |
+| [DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md) | 632 | Local, Docker, AWS ECS, and Kubernetes deployment |
+| [AI_DEVELOPMENT_GUIDE.md](docs/AI_DEVELOPMENT_GUIDE.md) | 1,247 | Complete AI-augmented development process and prompts |
+| [DESIGN_REVIEW.md](docs/DESIGN_REVIEW.md) | 1,416 | Staff+ production readiness review and recommendations |
+
+**Total Documentation**: 6,500+ lines covering architecture, implementation, deployment, and operations.
 
 ---
 
