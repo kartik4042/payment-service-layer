@@ -1,4 +1,6 @@
-# [Payment Orchestration System](https://htmlpreview.github.io/?https://github.com/kartik4042/payment-service-layer/blob/main/index.html)
+# Payment Orchestration System
+
+🌐 **[View Interactive Architecture →](https://htmlpreview.github.io/?https://github.com/kartik4042/payment-service-layer/blob/main/index.html)**
 
 > A production-ready payment orchestration platform that abstracts payment complexity and provides a unified interface for processing payments across multiple payment service providers.
 
